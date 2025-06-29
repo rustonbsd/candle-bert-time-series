@@ -7,9 +7,9 @@
 //! - Upstream [Github repo](https://github.com/google-research/bert).
 //! - See bert in [candle-examples](https://github.com/huggingface/candle/tree/main/candle-examples/) for runnable code
 //!
-use candle_core::{D, DType, Device, Result, Tensor};
-use candle_nn::{Embedding, Module, VarBuilder, embedding};
-use candle_transformers::models::with_tracing::{LayerNorm, Linear, layer_norm, linear};
+use candle_transformers::models::with_tracing::{layer_norm, linear, LayerNorm, Linear};
+use candle_core::{DType, Device, Result, Tensor};
+use candle_nn::{embedding, Embedding, Module, VarBuilder};
 use serde::Deserialize;
 
 pub const DTYPE: DType = DType::F32;
@@ -34,7 +34,7 @@ impl HiddenActLayer {
         Self { act, span }
     }
 
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
         let _enter = self.span.enter();
         match self.act {
             // https://github.com/huggingface/transformers/blob/cd4584e3c809bb9e1392ccd3fe38b40daba5519a/src/transformers/activations.py#L213
@@ -55,7 +55,7 @@ pub enum PositionEmbeddingType {
 // https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/bert/configuration_bert.py#L1
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Config {
-    pub num_time_series: usize,
+    pub vocab_size: usize,
     pub hidden_size: usize,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
@@ -63,19 +63,22 @@ pub struct Config {
     pub hidden_act: HiddenAct,
     pub hidden_dropout_prob: f64,
     pub max_position_embeddings: usize,
+    pub type_vocab_size: usize,
     pub initializer_range: f64,
     pub layer_norm_eps: f64,
+    pub pad_token_id: usize,
     #[serde(default)]
     pub position_embedding_type: PositionEmbeddingType,
     #[serde(default)]
     pub use_cache: bool,
+    pub classifier_dropout: Option<f64>,
     pub model_type: Option<String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            num_time_series: 100,
+            vocab_size: 30522,
             hidden_size: 768,
             num_hidden_layers: 12,
             num_attention_heads: 12,
@@ -83,10 +86,13 @@ impl Default for Config {
             hidden_act: HiddenAct::Gelu,
             hidden_dropout_prob: 0.1,
             max_position_embeddings: 512,
+            type_vocab_size: 2,
             initializer_range: 0.02,
             layer_norm_eps: 1e-12,
+            pad_token_id: 0,
             position_embedding_type: PositionEmbeddingType::Absolute,
             use_cache: true,
+            classifier_dropout: None,
             model_type: Some("bert".to_string()),
         }
     }
@@ -96,7 +102,7 @@ impl Config {
     fn _all_mini_lm_l6_v2() -> Self {
         // https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/blob/main/config.json
         Self {
-            num_time_series: 100,
+            vocab_size: 30522,
             hidden_size: 384,
             num_hidden_layers: 6,
             num_attention_heads: 12,
@@ -104,10 +110,13 @@ impl Config {
             hidden_act: HiddenAct::Gelu,
             hidden_dropout_prob: 0.1,
             max_position_embeddings: 512,
+            type_vocab_size: 2,
             initializer_range: 0.02,
             layer_norm_eps: 1e-12,
+            pad_token_id: 0,
             position_embedding_type: PositionEmbeddingType::Absolute,
             use_cache: true,
+            classifier_dropout: None,
             model_type: Some("bert".to_string()),
         }
     }
@@ -132,64 +141,63 @@ impl Module for Dropout {
     }
 }
 
-struct FinancialEmbeddings {
-    // A Linear layer to project our input vector (e.g., 100 cryptos)
-    // into the model's hidden dimension (e.g., 768).
-    input_projection: Linear,
-    // We keep position_embeddings to give the model a sense of time.
-    position_embeddings: Embedding,
+// https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/bert/modeling_bert.py#L180
+struct BertEmbeddings {
+    word_embeddings: Embedding,
+    position_embeddings: Option<Embedding>,
+    token_type_embeddings: Embedding,
     layer_norm: LayerNorm,
     dropout: Dropout,
     span: tracing::Span,
 }
 
-impl FinancialEmbeddings {
-    // Note the change in the function signature to use our new Config.
+impl BertEmbeddings {
     fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        // The new linear layer.
-        let input_projection = linear(
-            config.num_time_series,
+        let word_embeddings = embedding(
+            config.vocab_size,
             config.hidden_size,
-            vb.pp("embeddings.input_projection"),
+            vb.pp("word_embeddings"),
         )?;
         let position_embeddings = embedding(
             config.max_position_embeddings,
             config.hidden_size,
-            vb.pp("embeddings.position_embeddings"),
+            vb.pp("position_embeddings"),
+        )?;
+        let token_type_embeddings = embedding(
+            config.type_vocab_size,
+            config.hidden_size,
+            vb.pp("token_type_embeddings"),
         )?;
         let layer_norm = layer_norm(
             config.hidden_size,
             config.layer_norm_eps,
-            vb.pp("embeddings.LayerNorm"),
+            vb.pp("LayerNorm"),
         )?;
         Ok(Self {
-            input_projection,
-            position_embeddings,
+            word_embeddings,
+            position_embeddings: Some(position_embeddings),
+            token_type_embeddings,
             layer_norm,
             dropout: Dropout::new(config.hidden_dropout_prob),
             span: tracing::span!(tracing::Level::TRACE, "embeddings"),
         })
     }
 
-    // The forward pass now accepts a float tensor `input_returns`
-    // instead of integer `input_ids`.
-    fn forward(&self, input_returns: &Tensor) -> Result<Tensor> {
+    fn forward(&self, input_ids: &Tensor, token_type_ids: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let (_bsize, seq_len, _num_cryptos) = input_returns.dims3()?;
-
-        // Project the input from (batch, seq_len, 100) to (batch, seq_len, 768)
-        let input_embeddings = self.input_projection.forward(input_returns)?;
-
-        // The position embedding logic remains the same.
-        let position_ids = (0..seq_len as u32).collect::<Vec<_>>();
-        let position_ids = Tensor::new(&position_ids[..], input_returns.device())?;
-        let position_embeddings = self.position_embeddings.forward(&position_ids)?;
-
-        // Add the projected input and positional info together.
-        //let embeddings = (&input_embeddings + position_embeddings)?;
-        let embeddings = input_embeddings.broadcast_add(&position_embeddings.unsqueeze(0)?)?;
+        let (_bsize, seq_len) = input_ids.dims2()?;
+        let input_embeddings = self.word_embeddings.forward(input_ids)?;
+        let token_type_embeddings = self.token_type_embeddings.forward(token_type_ids)?;
+        let mut embeddings = (&input_embeddings + token_type_embeddings)?;
+        if let Some(position_embeddings) = &self.position_embeddings {
+            // TODO: Proper absolute positions?
+            let position_ids = (0..seq_len as u32).collect::<Vec<_>>();
+            let position_ids = Tensor::new(&position_ids[..], input_ids.device())?;
+            embeddings = embeddings.broadcast_add(&position_embeddings.forward(&position_ids)?)?
+        }
         let embeddings = self.layer_norm.forward(&embeddings)?;
-        self.dropout.forward(&embeddings)
+        let embeddings = self.dropout.forward(&embeddings)?;
+        Ok(embeddings)
     }
 }
 
@@ -250,13 +258,13 @@ impl BertSelfAttention {
         let attention_scores = attention_scores.broadcast_add(attention_mask)?;
         let attention_probs = {
             let _enter_sm = self.span_softmax.enter();
-            candle_nn::ops::softmax(&attention_scores, D::Minus1)?
+            candle_nn::ops::softmax(&attention_scores, candle_core::D::Minus1)?
         };
         let attention_probs = self.dropout.forward(&attention_probs)?;
 
         let context_layer = attention_probs.matmul(&value_layer)?;
         let context_layer = context_layer.transpose(1, 2)?.contiguous()?;
-        let context_layer = context_layer.flatten_from(D::Minus2)?;
+        let context_layer = context_layer.flatten_from(candle_core::D::Minus2)?;
         Ok(context_layer)
     }
 }
@@ -447,18 +455,35 @@ impl BertEncoder {
 }
 
 // https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/bert/modeling_bert.py#L874
-pub struct FinancialTransformerModel {
-    embeddings: FinancialEmbeddings,
+pub struct BertModel {
+    embeddings: BertEmbeddings,
     encoder: BertEncoder,
     pub device: Device,
     span: tracing::Span,
 }
 
-impl FinancialTransformerModel {
+impl BertModel {
     pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        let embeddings = FinancialEmbeddings::load(vb.pp("embeddings"), config)?;
-        // The original BertEncoder can be reused without changes.
-        let encoder = BertEncoder::load(vb.pp("encoder"), config)?;
+        let (embeddings, encoder) = match (
+            BertEmbeddings::load(vb.pp("embeddings"), config),
+            BertEncoder::load(vb.pp("encoder"), config),
+        ) {
+            (Ok(embeddings), Ok(encoder)) => (embeddings, encoder),
+            (Err(err), _) | (_, Err(err)) => {
+                if let Some(model_type) = &config.model_type {
+                    if let (Ok(embeddings), Ok(encoder)) = (
+                        BertEmbeddings::load(vb.pp(format!("{model_type}.embeddings")), config),
+                        BertEncoder::load(vb.pp(format!("{model_type}.encoder")), config),
+                    ) {
+                        (embeddings, encoder)
+                    } else {
+                        return Err(err);
+                    }
+                } else {
+                    return Err(err);
+                }
+            }
+        };
         Ok(Self {
             embeddings,
             encoder,
@@ -469,14 +494,17 @@ impl FinancialTransformerModel {
 
     pub fn forward(
         &self,
-        input_returns: &Tensor) -> Result<Tensor> {
+        input_ids: &Tensor,
+        token_type_ids: &Tensor,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let embedding_output = self.embeddings.forward(input_returns)?;
-
-        let (batch_size, seq_len,_) = embedding_output.dims3()?;
-        let attention_mask = Tensor::ones((batch_size, seq_len), DType::U8, &self.device)?;
+        let embedding_output = self.embeddings.forward(input_ids, token_type_ids)?;
+        let attention_mask = match attention_mask {
+            Some(attention_mask) => attention_mask.clone(),
+            None => input_ids.ones_like()?,
+        };
         let dtype = embedding_output.dtype();
-        
         // https://github.com/huggingface/transformers/blob/6eedfa6dd15dc1e22a55ae036f681914e5a0d9a1/src/transformers/models/bert/modeling_bert.py#L995
         let attention_mask = get_extended_attention_mask(&attention_mask, dtype)?;
         let sequence_output = self.encoder.forward(&embedding_output, &attention_mask)?;
@@ -541,7 +569,7 @@ pub struct BertLMPredictionHead {
 impl BertLMPredictionHead {
     pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
         let transform = BertPredictionHeadTransform::load(vb.pp("transform"), config)?;
-        let decoder = linear(config.hidden_size, config.num_time_series, vb.pp("decoder"))?;
+        let decoder = linear(config.hidden_size, config.vocab_size, vb.pp("decoder"))?;
         Ok(Self { transform, decoder })
     }
 }
@@ -571,43 +599,27 @@ impl Module for BertOnlyMLMHead {
     }
 }
 
-/* */
-pub struct RegressionHead {
-    transform: BertPredictionHeadTransform,
-    decoder: Linear,
+pub struct BertForMaskedLM {
+    bert: BertModel,
+    cls: BertOnlyMLMHead,
 }
 
-impl RegressionHead {
+impl BertForMaskedLM {
     pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        let transform = BertPredictionHeadTransform::load(vb.pp("transform"), config)?;
-        // The decoder now outputs `num_cryptos` continuous values
-        let decoder = linear(config.hidden_size, config.num_time_series, vb.pp("decoder"))?;
-        Ok(Self { transform, decoder })
-    }
-}
-
-impl Module for RegressionHead {
-    fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
-        self.decoder
-            .forward(&self.transform.forward(hidden_states)?)
-    }
-}
-/* */
-
-pub struct FinancialTransformerForMaskedRegression {
-    bert: FinancialTransformerModel,
-    head: RegressionHead,
-}
-
-impl FinancialTransformerForMaskedRegression {
-pub fn load(vb: VarBuilder, config: &Config) -> Result<Self> {
-        let bert = FinancialTransformerModel::load(vb.pp("transformer"), config)?;
-        let head = RegressionHead::load(vb.pp("head"), config)?;
-        Ok(Self { bert, head })
+        let bert = BertModel::load(vb.pp("bert"), config)?;
+        let cls = BertOnlyMLMHead::load(vb.pp("cls"), config)?;
+        Ok(Self { bert, cls })
     }
 
-    pub fn forward(&self, input_returns: &Tensor) -> Result<Tensor> {
-        let sequence_output = self.bert.forward(input_returns)?;
-        self.head.forward(&sequence_output)
+    pub fn forward(
+        &self,
+        input_ids: &Tensor,
+        token_type_ids: &Tensor,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let sequence_output = self
+            .bert
+            .forward(input_ids, token_type_ids, attention_mask)?;
+        self.cls.forward(&sequence_output)
     }
 }
