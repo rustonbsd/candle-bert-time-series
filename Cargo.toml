@@ -1,0 +1,13 @@
+[package]
+name = "candle-bert-time-series"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+candle-core = {version="0.9.1"}
+candle-nn = "0.9.1"
+candle-transformers = "0.9.1"
+anyhow = "1"
+serde ={ version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
