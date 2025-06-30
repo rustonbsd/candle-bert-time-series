@@ -1,5 +1,7 @@
 apt update
-apt install -y build-essential pkg-config libssl-dev
+apt install -y build-essential pkg-config libssl-dev davfs2
+
+mkdir /mnt/storage-box
 
 # Linux
 wget https://github.com/rustonbsd/iroh-ssh/releases/download/0.2.0/iroh-ssh.linux
@@ -26,3 +28,5 @@ cargo build --release --example download_data
 
 mullvad account login
 mullvad relay set location de
+
+mount -t davfs https://u470372.your-storagebox.de /mnt/storage-box
