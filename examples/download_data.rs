@@ -1,16 +1,14 @@
 use anyhow::Result;
 use chrono::{Datelike, Duration, NaiveDate};
 use polars::prelude::*;
+use rayon::prelude::*;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::thread;
 use walkdir;
 
 const DAILY_BASE_URL: &str = "https://data.binance.vision/data/spot/daily/aggTrades";
 const MONTHLY_BASE_URL: &str = "https://data.binance.vision/data/spot/monthly/aggTrades";
-const MAX_CONCURRENT_REQUESTS: usize = 20; // Number of parallel downloads
 const BATCH_SIZE: usize = 30; // Save data every 30 days to avoid losing progress
 
 /// Check what data already exists by scanning the partitioned directory structure
@@ -214,39 +212,25 @@ fn download_agg_trades_for_pair(
         for (batch_num, date_batch) in daily_dates.chunks(BATCH_SIZE).enumerate() {
             println!("Processing daily batch {} ({} dates)...", batch_num + 1, date_batch.len());
 
-            // Process downloads with threading for this batch
-            let successful_data = Arc::new(Mutex::new(Vec::new()));
-            let mut handles = vec![];
-
-            for chunk in date_batch.chunks((date_batch.len() + MAX_CONCURRENT_REQUESTS - 1) / MAX_CONCURRENT_REQUESTS) {
-                for &date in chunk {
-                    let client = client.clone();
-                    let pair = pair.to_string();
-                    let successful_data = Arc::clone(&successful_data);
-
-                    let handle = thread::spawn(move || {
-                        match download_day_data(&client, &pair, date) {
-                            Ok(Some(data)) => {
-                                successful_data.lock().unwrap().push(data);
-                            }
-                            Ok(None) => {
-                                // No data for this day, that's fine
-                            }
-                            Err(e) => {
-                                eprintln!("Error downloading data for {}: {}", date, e);
-                            }
-                        }
-                    });
-                    handles.push(handle);
+            // Use rayon for parallel processing - much more efficient than manual threading
+            let batch_results: Vec<_> = date_batch.par_iter().map(|&date| {
+                match download_day_data(&client, pair, date) {
+                    Ok(Some(data)) => Some((date, data)),
+                    Ok(None) => {
+                        // No data for this day, that's fine
+                        None
+                    }
+                    Err(e) => {
+                        eprintln!("Error downloading data for {}: {}", date, e);
+                        None
+                    }
                 }
-            }
+            }).collect();
 
-            // Wait for all downloads to complete
-            for handle in handles {
-                handle.join().unwrap();
-            }
-
-            let batch_data = successful_data.lock().unwrap().clone();
+            // Extract successful downloads
+            let batch_data: Vec<_> = batch_results.into_iter()
+                .filter_map(|result| result.map(|(_, df)| df))
+                .collect();
 
             // Save this batch if we have data
             if !batch_data.is_empty() {
@@ -394,21 +378,21 @@ fn download_data_attempt(
     file_in_zip.read_to_string(&mut csv_content)
         .map_err(|e| anyhow::anyhow!("Failed to read CSV content for {}: {}", period_str, e))?;
 
-    // Parse CSV content with Polars
+    // Parse CSV content with Polars - keep it lazy and minimal processing
     let df = CsvReadOptions::default()
         .with_has_header(false)
         .into_reader_with_file_handle(std::io::Cursor::new(csv_content.as_bytes()))
         .finish()?
         .lazy()
         .with_columns([
-            col("column_1").alias("agg_trade_id"),
-            col("column_2").alias("price"),
-            col("column_3").alias("quantity"),
-            col("column_4").alias("first_trade_id"),
-            col("column_5").alias("last_trade_id"),
-            col("column_6").alias("timestamp"),
-            col("column_7").alias("is_buyer_maker"),
-            col("column_8").alias("is_best_match"),
+            col("column_1").alias("agg_trade_id").cast(DataType::UInt64),
+            col("column_2").alias("price").cast(DataType::Float64),
+            col("column_3").alias("quantity").cast(DataType::Float64),
+            col("column_4").alias("first_trade_id").cast(DataType::UInt64),
+            col("column_5").alias("last_trade_id").cast(DataType::UInt64),
+            col("column_6").alias("timestamp").cast(DataType::Int64),
+            col("column_7").alias("is_buyer_maker").cast(DataType::Boolean),
+            col("column_8").alias("is_best_match").cast(DataType::Boolean),
         ])
         .select([
             col("agg_trade_id"),
@@ -428,7 +412,7 @@ fn download_data_attempt(
     Ok(Some(df))
 }
 
-/// Save monthly data to a partitioned Parquet file
+/// Save monthly data to a partitioned Parquet file (no sorting - data should already be sorted)
 fn save_monthly_parquet(data_dir: &Path, month_period: &str, data: DataFrame) -> Result<()> {
     // Parse month period (YYYY-MM)
     let year = &month_period[0..4];
@@ -446,23 +430,21 @@ fn save_monthly_parquet(data_dir: &Path, month_period: &str, data: DataFrame) ->
         return Ok(());
     }
 
-    let sorted_df = data
-        .lazy()
-        .sort(["timestamp"], SortMultipleOptions::default())
-        .collect()?;
-
+    // Write directly without sorting - Binance data should already be chronological
     let mut file = File::create(&file_path)?;
     ParquetWriter::new(&mut file)
-        .finish(&mut sorted_df.clone())?;
+        .with_compression(ParquetCompression::Snappy)
+        .finish(&mut data.clone())?;
 
-    println!("✅ Saved monthly data: {} ({} rows)", file_path.display(), sorted_df.height());
+    println!("✅ Saved monthly data: {} ({} rows)", file_path.display(), data.height());
     Ok(())
 }
 
-/// Save daily data batch to partitioned Parquet files
+/// Save daily data batch to partitioned Parquet files (optimized)
 fn save_daily_parquet_batch(data_dir: &Path, dates: &[NaiveDate], dataframes: Vec<DataFrame>) -> Result<()> {
-    // Each DataFrame corresponds to a date
-    for (date, df) in dates.iter().zip(dataframes.iter()) {
+    // Process files in parallel using rayon
+
+    let results: Vec<Result<()>> = dates.par_iter().zip(dataframes.par_iter()).map(|(date, df)| {
         let year = date.year().to_string();
         let month = format!("{:02}", date.month());
 
@@ -475,26 +457,42 @@ fn save_daily_parquet_batch(data_dir: &Path, dates: &[NaiveDate], dataframes: Ve
 
         if file_path.exists() {
             println!("Daily file already exists: {}", file_path.display());
-            continue;
+            return Ok(());
         }
 
-        let sorted_df = df
-            .clone()
-            .lazy()
-            .sort(["timestamp"], SortMultipleOptions::default())
-            .collect()?;
-
+        // Write directly without sorting - Binance data should already be chronological
         let mut file = File::create(&file_path)?;
         ParquetWriter::new(&mut file)
-            .finish(&mut sorted_df.clone())?;
+            .with_compression(ParquetCompression::Snappy)
+            .finish(&mut df.clone())?;
 
-        println!("✅ Saved daily data: {} ({} rows)", file_path.display(), sorted_df.height());
+        println!("✅ Saved daily data: {} ({} rows)", file_path.display(), df.height());
+        Ok(())
+    }).collect();
+
+    // Check for any errors
+    for result in results {
+        result?;
     }
 
     Ok(())
 }
 
 fn main() -> Result<()> {
+    // Configure Polars to use all available CPU cores
+    let num_cores = num_cpus::get();
+    unsafe {
+        std::env::set_var("POLARS_MAX_THREADS", num_cores.to_string());
+    }
+
+    // Configure rayon thread pool
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_cores)
+        .build_global()
+        .unwrap();
+
+    println!("Using {} CPU cores for parallel processing", num_cores);
+
     // --- Configuration ---
     let pair_to_download = "BTCUSDT";
     // Binance's BTC data starts on 2017-08-17
