@@ -308,11 +308,13 @@ fn download_monthly_data(
         },
         Err(e) => {
             println!("❌ Failed to download monthly data for {}: {}", month_period, e);
-            let output = Command::new("/bin/bash")
+            /*let output = Command::new("/bin/bash")
                 .arg("-c")
                 .arg("mullvad reconnect")
                 .output();
+
             println!("changing ip and trying again... \n({:?})", output);
+            */
             std::thread::sleep(std::time::Duration::from_secs(2));
             download_monthly_data(client, pair, month_period)
         },
@@ -491,6 +493,152 @@ fn save_daily_parquet_batch(data_dir: &Path, dates: &[NaiveDate], dataframes: Ve
     Ok(())
 }
 
+
+
+/// Read crypto pairs from pairlist.txt file
+fn read_crypto_pairs_from_file(file_path: &str) -> Result<Vec<String>> {
+    let content = std::fs::read_to_string(file_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read pairlist file {}: {}", file_path, e))?;
+
+    // Parse comma-separated pairs and clean them up
+    let pairs: Vec<String> = content
+        .split(',')
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    println!("Read {} crypto pairs from {}", pairs.len(), file_path);
+    Ok(pairs)
+}
+
+/// Fetch the start date for a crypto pair by scraping Binance's data directory
+fn get_start_date_for_pair(client: &reqwest::blocking::Client, pair: &str) -> NaiveDate {
+    match fetch_start_date_from_binance(client, pair) {
+        Ok(date) => {
+            println!("✅ Found start date for {}: {}", pair, date);
+            date
+        }
+        Err(e) => {
+            println!("⚠️ Failed to fetch start date for {}: {}. Using fallback date.", pair, e);
+            // Fallback to a conservative date
+            NaiveDate::from_ymd_opt(2020, 1, 1).unwrap()
+        }
+    }
+}
+
+/// Fetch the earliest available month for a crypto pair from Binance's data directory
+fn fetch_start_date_from_binance(client: &reqwest::blocking::Client, pair: &str) -> Result<NaiveDate> {
+    let url = format!("https://data.binance.vision/?prefix=data/spot/monthly/aggTrades/{}/", pair);
+
+    println!("🔍 Fetching start date for {} from: {}", pair, url);
+
+    // Make the request
+    let response = client.get(&url).send()
+        .map_err(|e| anyhow::anyhow!("Failed to fetch data directory for {}: {}", pair, e))?;
+
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!("HTTP error {} for {}", response.status(), pair));
+    }
+
+    let html_content = response.text()
+        .map_err(|e| anyhow::anyhow!("Failed to read HTML content for {}: {}", pair, e))?;
+
+    // Parse the HTML to find the earliest month
+    parse_earliest_month_from_html(&html_content, pair)
+}
+
+/// Parse HTML content to find the earliest available month
+fn parse_earliest_month_from_html(html_content: &str, pair: &str) -> Result<NaiveDate> {
+    // The Binance data directory uses JavaScript to load content dynamically
+    // We need to look for the S3 bucket structure or make a direct API call
+    // Let's try the S3 API approach instead
+
+    // Extract the S3 bucket URL from the HTML
+    if html_content.contains("s3-ap-northeast-1.amazonaws.com/data.binance.vision") {
+        // Use the S3 API to list objects
+        return fetch_start_date_from_s3_api(pair);
+    }
+
+    Err(anyhow::anyhow!("Could not parse HTML content for {}", pair))
+}
+
+/// Fetch start date using S3 API directly
+fn fetch_start_date_from_s3_api(pair: &str) -> Result<NaiveDate> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
+    // Use S3 list-objects API
+    let s3_url = format!(
+        "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision?list-type=2&prefix=data/spot/monthly/aggTrades/{}/&delimiter=/",
+        pair
+    );
+
+    println!("🔍 Fetching from S3 API: {}", s3_url);
+
+    let response = client.get(&s3_url).send()
+        .map_err(|e| anyhow::anyhow!("Failed to fetch S3 listing for {}: {}", pair, e))?;
+
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!("S3 API error {} for {}", response.status(), pair));
+    }
+
+    let xml_content = response.text()
+        .map_err(|e| anyhow::anyhow!("Failed to read S3 XML for {}: {}", pair, e))?;
+
+    parse_earliest_month_from_s3_xml(&xml_content, pair)
+}
+
+/// Parse S3 XML response to find the earliest month
+fn parse_earliest_month_from_s3_xml(xml_content: &str, pair: &str) -> Result<NaiveDate> {
+    let mut earliest_month: Option<String> = None;
+
+    // Look for <Key> elements containing month patterns like "BTCUSDT-aggTrades-2017-08.zip"
+    for line in xml_content.lines() {
+        if line.contains("<Key>") && line.contains(&format!("{}-aggTrades-", pair)) {
+            // Extract the key content
+            if let Some(start) = line.find("<Key>") {
+                if let Some(end) = line.find("</Key>") {
+                    let key = &line[start + 5..end];
+
+                    // Extract month pattern: PAIR-aggTrades-YYYY-MM.zip
+                    if let Some(month_start) = key.rfind("-aggTrades-") {
+                        let month_part = &key[month_start + 11..];
+                        if let Some(zip_pos) = month_part.find(".zip") {
+                            let month_str = &month_part[..zip_pos]; // Should be YYYY-MM
+
+                            if month_str.len() == 7 && month_str.chars().nth(4) == Some('-') {
+                                match &earliest_month {
+                                    None => earliest_month = Some(month_str.to_string()),
+                                    Some(current_earliest) => {
+                                        if month_str < current_earliest.as_str() {
+                                            earliest_month = Some(month_str.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    match earliest_month {
+        Some(month_str) => {
+            // Parse YYYY-MM format and return the first day of that month
+            let year: i32 = month_str[0..4].parse()
+                .map_err(|_| anyhow::anyhow!("Invalid year in month string: {}", month_str))?;
+            let month: u32 = month_str[5..7].parse()
+                .map_err(|_| anyhow::anyhow!("Invalid month in month string: {}", month_str))?;
+
+            NaiveDate::from_ymd_opt(year, month, 1)
+                .ok_or_else(|| anyhow::anyhow!("Invalid date: {}-{}-01", year, month))
+        }
+        None => Err(anyhow::anyhow!("No monthly data found for {}", pair))
+    }
+}
+
 fn main() -> Result<()> {
     // Configure Polars to use all available CPU cores
     let num_cores = num_cpus::get();
@@ -507,17 +655,90 @@ fn main() -> Result<()> {
     println!("Using {} CPU cores for parallel processing", num_cores);
 
     // --- Configuration ---
-    let pair_to_download = "BTCUSDT";
-    // Binance's BTC data starts on 2017-08-17
-    let start_date = NaiveDate::from_ymd_opt(2017, 8, 17).unwrap();
     let output_dir = PathBuf::from("./crypto_data");
+    let pairlist_file = "pairlist.txt";
+    const BATCH_SIZE: usize = 5; // Process 5 pairs in parallel at a time
 
-    download_agg_trades_for_pair(pair_to_download, start_date, &output_dir)?;
+    // Read crypto pairs from file
+    let pair_names = read_crypto_pairs_from_file(pairlist_file)?;
 
-    // You can add more pairs here
-    // let pair_to_download_2 = "ETHUSDT";
-    // let start_date_2 = NaiveDate::from_ymd_opt(2017, 8, 17).unwrap();
-    // download_agg_trades_for_pair(pair_to_download_2, start_date_2, &output_dir)?;
+    println!("Starting batch download for {} crypto pairs in batches of {}",
+             pair_names.len(), BATCH_SIZE);
+
+    let mut total_successful = 0;
+    let mut total_failed = 0;
+    let total_batches = (pair_names.len() + BATCH_SIZE - 1) / BATCH_SIZE;
+
+    // Process pairs in batches of 5
+    for (batch_num, batch) in pair_names.chunks(BATCH_SIZE).enumerate() {
+        println!("\n🚀 Starting batch {} of {} ({} pairs)",
+                 batch_num + 1, total_batches, batch.len());
+
+        // Show which pairs are in this batch
+        for pair in batch {
+            println!("   - {} (start date will be fetched dynamically)", pair);
+        }
+
+        // Download this batch in parallel
+        let batch_results: Vec<Result<()>> = batch.par_iter().map(|pair| {
+            println!("� Starting download for {}", pair);
+
+            // Create HTTP client for fetching start date
+            let start_date_client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| reqwest::blocking::Client::new());
+
+            // Fetch start date dynamically
+            let start_date = get_start_date_for_pair(&start_date_client, pair);
+            println!("📅 Using start date {} for {}", start_date, pair);
+
+            let result = download_agg_trades_for_pair(pair, start_date, &output_dir);
+            match &result {
+                Ok(_) => println!("✅ Completed download for {}", pair),
+                Err(e) => println!("❌ Failed download for {}: {}", pair, e),
+            }
+            result
+        }).collect();
+
+        // Count results for this batch
+        let mut batch_successful = 0;
+        let mut batch_failed = 0;
+
+        for (_i, result) in batch_results.iter().enumerate() {
+            match result {
+                Ok(_) => {
+                    batch_successful += 1;
+                    total_successful += 1;
+                }
+                Err(_) => {
+                    batch_failed += 1;
+                    total_failed += 1;
+                }
+            }
+        }
+
+        println!("📊 Batch {} Summary: {} successful, {} failed",
+                 batch_num + 1, batch_successful, batch_failed);
+
+        // Small delay between batches to be nice to the server
+        if batch_num + 1 < total_batches {
+            println!("⏳ Waiting 5 seconds before next batch...");
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+    }
+
+    println!("\n🎉 Final Summary:");
+    println!("   Total pairs processed: {}", pair_names.len());
+    println!("   Total successful: {}", total_successful);
+    println!("   Total failed: {}", total_failed);
+    println!("   Success rate: {:.1}%", (total_successful as f64 / pair_names.len() as f64) * 100.0);
+    println!("   Data directory: {}", output_dir.display());
+
+    if total_failed > 0 {
+        println!("\n⚠️  Some downloads failed. You can re-run the program to retry failed downloads.");
+        println!("   Failed pairs will be automatically detected and resumed from where they left off.");
+    }
 
     Ok(())
 }

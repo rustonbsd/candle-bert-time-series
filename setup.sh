@@ -23,3 +23,6 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source $HOME/.cargo/env
 
 cargo build --release --example download_data
+
+mullvad account login
+mullvad relay set location de
