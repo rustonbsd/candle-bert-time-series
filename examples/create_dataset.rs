@@ -218,11 +218,25 @@ fn combine_batch_data(batch_data: Vec<DataFrame>) -> Result<DataFrame> {
             .collect()?;
     }
 
-    // Fill nulls with 0.0 for missing return values
-    let result = result
-        .lazy()
-        .with_columns([all().fill_null(lit(0.0f64))])
-        .collect()?;
+    // Fill nulls with 0.0 for missing return values (exclude datetime column)
+    // Get all column names and create fill_null expressions for return columns only
+    let column_names = result.get_column_names();
+    let mut fill_expressions = Vec::new();
+
+    for col_name in column_names {
+        if col_name != "datetime" && col_name.ends_with("_return") {
+            fill_expressions.push(col(col_name.as_str()).fill_null(lit(0.0f64)));
+        }
+    }
+
+    let result = if !fill_expressions.is_empty() {
+        result
+            .lazy()
+            .with_columns(fill_expressions)
+            .collect()?
+    } else {
+        result
+    };
 
     println!("    ✓ Combined into DataFrame with {} rows and {} columns",
              result.height(), result.width());
@@ -292,10 +306,20 @@ fn combine_all_batches(all_batches: Vec<DataFrame>, _timeline: DataFrame) -> Res
     }
 
     // Fill nulls with 0.0 for missing return values and clean up
+    // Get all column names and create fill_null expressions for return columns only
+    let column_names = unified_timeline.get_column_names();
+    let mut fill_expressions = Vec::new();
+
+    for col_name in column_names {
+        if col_name != "datetime" && col_name.ends_with("_return") {
+            fill_expressions.push(col(col_name.as_str()).fill_null(lit(0.0f64)));
+        }
+    }
+
     let final_df = unified_timeline
         .lazy()
         .sort(["datetime"], SortMultipleOptions::default())
-        .with_columns([all().fill_null(lit(0.0f64))])
+        .with_columns(fill_expressions) // Only fill nulls for return columns
         .drop(["datetime"]) // Remove timestamp for model input
         .collect()?;
 
