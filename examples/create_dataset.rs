@@ -72,8 +72,10 @@ pub fn create_dataset(
             lf,
             [col("datetime")],
             [col("datetime")],
-            JoinArgs::new(JoinType::Full),
-        );
+            JoinArgs::new(JoinType::Full).with_suffix(Some(PlSmallStr::from_static("_dup"))),
+        )
+        // Remove the duplicate datetime column that gets created during join
+        .drop(["datetime_dup"]);
     }
 
     // 5. Clean the joined data
