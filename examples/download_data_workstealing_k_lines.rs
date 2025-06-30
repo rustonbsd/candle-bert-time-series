@@ -299,15 +299,16 @@ fn download_klines_for_pair(
         pair, actual_start_date, end_date
     );
 
-    // Determine which months to download as monthly files vs daily files
+    // Group months by year for yearly batch processing
     let current_month = end_date.format("%Y-%m").to_string();
-    let mut monthly_periods = Vec::new();
+    let mut yearly_batches: std::collections::HashMap<i32, Vec<String>> = std::collections::HashMap::new();
     let mut daily_dates = Vec::new();
 
-    // Group dates by month
+    // Group dates by year and month
     let mut current_date = actual_start_date;
     while current_date <= end_date {
         let month_str = current_date.format("%Y-%m").to_string();
+        let year = current_date.year();
 
         if month_str == current_month {
             // Current month - use daily downloads
@@ -316,8 +317,8 @@ fn download_klines_for_pair(
                 current_date = current_date.succ_opt().unwrap();
             }
         } else {
-            // Historical month - try monthly download first
-            monthly_periods.push(month_str.clone());
+            // Historical month - group by year for batch processing
+            yearly_batches.entry(year).or_insert_with(Vec::new).push(month_str.clone());
             // Skip to next month
             let next_month = if current_date.month() == 12 {
                 NaiveDate::from_ymd_opt(current_date.year() + 1, 1, 1).unwrap()
@@ -328,31 +329,57 @@ fn download_klines_for_pair(
         }
     }
 
-    println!("Monthly periods to download: {}", monthly_periods.len());
+    let total_years = yearly_batches.len();
+    let total_months: usize = yearly_batches.values().map(|v| v.len()).sum();
+    println!("Years to process: {} (containing {} months total)", total_years, total_months);
     println!("Daily dates to download: {}", daily_dates.len());
 
     let mut total_saved = 0;
 
-    // Download monthly data first
-    for (i, month_period) in monthly_periods.iter().enumerate() {
-        println!("Downloading monthly data for {} ({}/{})", month_period, i + 1, monthly_periods.len());
+    // Process yearly batches
+    let mut sorted_years: Vec<_> = yearly_batches.keys().collect();
+    sorted_years.sort();
 
-        match download_monthly_data(&client, pair, month_period) {
-            Ok(Some(data)) => {
-                println!("Downloaded {} rows for month {}", data.height(), month_period);
-                save_monthly_parquet(&pair_data_dir, month_period, data)?;
-                total_saved += 1;
-                println!("✓ Saved monthly data for {}", month_period);
+    for (year_idx, &year) in sorted_years.iter().enumerate() {
+        let months_in_year = &yearly_batches[year];
+        println!("Processing year {} ({}/{}) with {} months", year, year_idx + 1, sorted_years.len(), months_in_year.len());
+
+        let mut year_dataframes = Vec::new();
+        let mut failed_months = Vec::new();
+
+        // Download all months for this year
+        for (month_idx, month_period) in months_in_year.iter().enumerate() {
+            println!("  Downloading monthly data for {} ({}/{})", month_period, month_idx + 1, months_in_year.len());
+
+            match download_monthly_data(&client, pair, month_period) {
+                Ok(Some(data)) => {
+                    println!("  ✓ Downloaded {} rows for month {}", data.height(), month_period);
+                    year_dataframes.push(data);
+                }
+                Ok(None) => {
+                    println!("  ⚠ No monthly data available for {}, will try daily downloads", month_period);
+                    failed_months.push(month_period.clone());
+                }
+                Err(e) => {
+                    println!("  ⚠ Error downloading monthly data for {}: {}", month_period, e);
+                    println!("    Falling back to daily downloads for this month");
+                    failed_months.push(month_period.clone());
+                }
             }
-            Ok(None) => {
-                println!("⚠ No monthly data available for {}, will try daily downloads", month_period);
-                add_month_to_daily_fallback(month_period, &actual_start_date, &end_date, &mut daily_dates);
-            }
-            Err(e) => {
-                println!("⚠ Error downloading monthly data for {}: {}", month_period, e);
-                println!("  Falling back to daily downloads for this month");
-                add_month_to_daily_fallback(month_period, &actual_start_date, &end_date, &mut daily_dates);
-            }
+        }
+
+        // Save the year's data if we have any
+        if !year_dataframes.is_empty() {
+            let total_rows: usize = year_dataframes.iter().map(|df| df.height()).sum();
+            println!("  Combining {} months of data ({} total rows) for year {}", year_dataframes.len(), total_rows, year);
+            save_yearly_parquet(&pair_data_dir, *year, year_dataframes)?;
+            total_saved += 1;
+            println!("  ✅ Saved yearly data for {} ({} months, {} rows)", year, months_in_year.len() - failed_months.len(), total_rows);
+        }
+
+        // Add failed months to daily fallback
+        for failed_month in failed_months {
+            add_month_to_daily_fallback(&failed_month, &actual_start_date, &end_date, &mut daily_dates);
         }
     }
 
@@ -577,33 +604,48 @@ fn download_data_attempt(
     Ok(Some(df))
 }
 
-/// Save monthly data to a partitioned Parquet file (no sorting - data should already be sorted)
-fn save_monthly_parquet(data_dir: &Path, month_period: &str, data: DataFrame) -> Result<()> {
-    // Parse month period (YYYY-MM)
-    let year = &month_period[0..4];
-    let month = &month_period[5..7];
+/// Save yearly data to a single Parquet file (combines multiple months)
+fn save_yearly_parquet(data_dir: &Path, year: i32, dataframes: Vec<DataFrame>) -> Result<()> {
+    // Create directory structure: data_dir/
+    fs::create_dir_all(data_dir)?;
 
-    // Create directory structure: data_dir/YYYY/MM/
-    let month_dir = data_dir.join(year).join(month);
-    fs::create_dir_all(&month_dir)?;
-
-    // Save as YYYY-MM.parquet
-    let file_path = month_dir.join(format!("{}.parquet", month_period));
+    // Save as YYYY.parquet
+    let file_path = data_dir.join(format!("{}.parquet", year));
 
     if file_path.exists() {
-        println!("Monthly file already exists: {}", file_path.display());
+        println!("Yearly file already exists: {}", file_path.display());
         return Ok(());
     }
 
-    // Write directly without sorting - Binance data should already be chronological
+    // Combine all dataframes for the year
+    let combined_df = if dataframes.len() == 1 {
+        dataframes.into_iter().next().unwrap()
+    } else {
+        // Concatenate all dataframes using polars concat function
+        let lazy_frames: Vec<LazyFrame> = dataframes.into_iter()
+            .map(|df| df.lazy())
+            .collect();
+
+        // Use polars concat function to combine all lazy frames
+        let combined = concat(lazy_frames, Default::default())?;
+
+        // Sort by open_time to ensure chronological order
+        combined
+            .sort(["open_time"], SortMultipleOptions::default())
+            .collect()?
+    };
+
+    // Write the combined data
     let mut file = File::create(&file_path)?;
     ParquetWriter::new(&mut file)
         .with_compression(ParquetCompression::Snappy)
-        .finish(&mut data.clone())?;
+        .finish(&mut combined_df.clone())?;
 
-    println!("✅ Saved monthly data: {} ({} rows)", file_path.display(), data.height());
+    println!("✅ Saved yearly data: {} ({} rows)", file_path.display(), combined_df.height());
     Ok(())
 }
+
+
 
 /// Save daily data batch to partitioned Parquet files (optimized)
 fn save_daily_parquet_batch(data_dir: &Path, dates: &[NaiveDate], dataframes: Vec<DataFrame>) -> Result<()> {
@@ -659,7 +701,7 @@ fn main() -> Result<()> {
     println!("Using {} CPU cores for parallel processing", num_cores);
 
     // --- Configuration ---
-    let output_dir = PathBuf::from("/mnt/storage-box/crypto_data_k_lines/1m");
+    let output_dir = PathBuf::from("./crypto_data_k_lines/1m");
     let pairlist_file = "pairlist.txt";
     const CONCURRENT_JOBS: usize = 5; // Process 5 pairs concurrently
 
