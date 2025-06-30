@@ -60,6 +60,15 @@ pub fn create_dataset(
         if !batch_data.is_empty() {
             // Combine batch data
             let batch_combined = combine_batch_data(batch_data)?;
+
+            // Save intermediate batch result
+            let batch_file = output_path.parent().unwrap().join(format!("batch_{}.parquet", batch_idx + 1));
+            let mut file = fs::File::create(&batch_file)?;
+            ParquetWriter::new(&mut file)
+                .with_compression(ParquetCompression::Snappy)
+                .finish(&mut batch_combined.clone())?;
+            println!("  💾 Saved batch {} to: {}", batch_idx + 1, batch_file.display());
+
             all_return_data.push(batch_combined);
             println!("  ✓ Batch {} processed successfully", batch_idx + 1);
         }
@@ -147,19 +156,28 @@ fn combine_batch_data(mut batch_data: Vec<DataFrame>) -> Result<DataFrame> {
 
 /// Combine all batches into the final dataset
 fn combine_all_batches(all_batches: Vec<DataFrame>, timeline: DataFrame) -> Result<DataFrame> {
-    // Start with the timeline
+    // Start with just the return columns (no datetime)
+    let mut all_return_columns: Vec<polars::prelude::Column> = Vec::new();
+
+    // Extract all return columns from all batches
+    for (i, batch_df) in all_batches.into_iter().enumerate() {
+        println!("  Extracting columns from batch {} data...", i + 1);
+
+        // Get all columns except datetime
+        for column in batch_df.get_columns() {
+            if column.name() != "datetime" {
+                all_return_columns.push(column.clone());
+            }
+        }
+    }
+
+    // Create final dataframe by combining timeline with all return columns
+    println!("  Combining {} return columns with timeline...", all_return_columns.len());
     let mut final_df = timeline;
 
-    // Join each batch
-    for (i, batch_df) in all_batches.into_iter().enumerate() {
-        println!("  Joining batch {} data...", i + 1);
-
-        // Drop the datetime column from batch data since we already have it
-        let batch_returns = batch_df.drop("datetime")?;
-
-        // Add the batch data as new columns by getting the columns
-        let batch_columns = batch_returns.get_columns();
-        final_df = final_df.hstack(batch_columns)?;
+    // Add all return columns at once
+    if !all_return_columns.is_empty() {
+        final_df = final_df.hstack(&all_return_columns)?;
     }
 
     // Fill nulls and clean up
@@ -189,17 +207,72 @@ fn read_crypto_pairs_from_file(file_path: &str) -> Result<Vec<String>> {
     Ok(pairs)
 }
 
+/// Load existing batch files if they exist
+fn load_existing_batches(output_dir: &Path) -> Result<Vec<DataFrame>> {
+    let mut batches = Vec::new();
+    let mut batch_num = 1;
+
+    loop {
+        let batch_file = output_dir.join(format!("batch_{}.parquet", batch_num));
+        if batch_file.exists() {
+            println!("📂 Loading existing batch {}: {}", batch_num, batch_file.display());
+            let df = LazyFrame::scan_parquet(batch_file.to_str().unwrap(), Default::default())?.collect()?;
+            batches.push(df);
+            batch_num += 1;
+        } else {
+            break;
+        }
+    }
+
+    if !batches.is_empty() {
+        println!("✅ Loaded {} existing batch files", batches.len());
+    }
+
+    Ok(batches)
+}
+
 fn main() -> Result<()> {
     // Configuration
     let raw_data_dir = Path::new("/mnt/storage-box/crypto_data_k_lines/1m");
     let output_path = Path::new("/mnt/storage-box/crypto_data_k_lines/1m/processed_dataset.parquet");
     let pairlist_file = "pairlist.txt";
     let batch_size = 10; // Process 10 symbols at a time to avoid memory issues
+    let use_existing_batches = true; // Set to true to use existing batch files
 
     println!("🚀 Starting dataset creation process...");
     println!("📂 Raw data directory: {}", raw_data_dir.display());
     println!("💾 Output file: {}", output_path.display());
     println!("📦 Batch size: {}", batch_size);
+
+    if use_existing_batches {
+        // Try to load existing batch files
+        let output_dir = output_path.parent().unwrap();
+        let existing_batches = load_existing_batches(output_dir)?;
+
+        if !existing_batches.is_empty() {
+            println!("🔄 Using {} existing batch files, combining them...", existing_batches.len());
+
+            // Create a simple timeline from the first batch
+            let timeline = existing_batches[0].select(["datetime"])?.clone();
+
+            // Combine all existing batches
+            let final_df = combine_all_batches(existing_batches, timeline)?;
+
+            // Save the final dataset
+            println!(
+                "Saving processed dataset with shape {:?} to {}",
+                final_df.shape(),
+                output_path.display()
+            );
+            let mut file = fs::File::create(output_path)?;
+            ParquetWriter::new(&mut file)
+                .with_compression(ParquetCompression::Snappy)
+                .finish(&mut final_df.clone())?;
+
+            println!("✅ Dataset creation complete using existing batches!");
+            return Ok(());
+        }
+    }
 
     // Read crypto pairs from file
     let pairs = read_crypto_pairs_from_file(pairlist_file)?;
