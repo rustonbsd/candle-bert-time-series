@@ -5,6 +5,7 @@ use rayon::prelude::*;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use walkdir;
 
 const DAILY_BASE_URL: &str = "https://data.binance.vision/data/spot/daily/aggTrades";
@@ -118,7 +119,12 @@ fn download_agg_trades_for_pair(
     output_dir: &Path,
 ) -> Result<()> {
     let end_date = chrono::Utc::now().date_naive(); // Download up to today
-    let client = reqwest::blocking::Client::new();
+
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(600)) // 10 minutes
+        .build()?;
+    
     fs::create_dir_all(output_dir)?;
 
     // Create partitioned directory structure: output_dir/pair/YYYY/MM/
@@ -302,7 +308,13 @@ fn download_monthly_data(
         },
         Err(e) => {
             println!("❌ Failed to download monthly data for {}: {}", month_period, e);
-            Err(e)
+            let output = Command::new("/bin/bash")
+                .arg("-c")
+                .arg("mullvad reconnect")
+                .output();
+            println!("changing ip and trying again... \n({:?})", output);
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            download_monthly_data(client, pair, month_period)
         },
     }
 }
@@ -345,6 +357,7 @@ fn download_data_attempt(
     url: &str,
     period_str: &str,
 ) -> Result<Option<DataFrame>> {
+
     // Make the HTTP request
     let response = client.get(url).send()
         .map_err(|e| anyhow::anyhow!("Failed to send request to {}: {}", url, e))?;
