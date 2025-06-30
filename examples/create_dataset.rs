@@ -69,22 +69,12 @@ pub fn create_dataset(
         if !batch_data.is_empty() {
             println!("  Combining {} symbols in batch {}...", batch_data.len(), batch_idx + 1);
 
-            // Validate that all DataFrames have the same number of rows
-            let expected_rows = batch_data[0].height();
-            let mut all_same_size = true;
+            // Show DataFrame sizes for info (but don't skip due to mismatches)
             for (i, df) in batch_data.iter().enumerate() {
-                if df.height() != expected_rows {
-                    eprintln!("  ⚠️  DataFrame {} has {} rows, expected {}", i, df.height(), expected_rows);
-                    all_same_size = false;
-                }
+                println!("    Symbol {}: {} rows", i + 1, df.height());
             }
 
-            if !all_same_size {
-                eprintln!("  ❌ Skipping batch {} due to mismatched DataFrame sizes", batch_idx + 1);
-                continue;
-            }
-
-            // Combine batch data
+            // Combine batch data (now handles mismatched sizes by aligning to common timeline)
             match combine_batch_data(batch_data) {
                 Ok(batch_combined) => {
                     // Save intermediate batch result
@@ -168,7 +158,7 @@ fn process_single_symbol(symbol_dir: &Path, symbol: &str) -> Result<DataFrame> {
     Ok(processed_df)
 }
 
-/// Combine data from a batch of symbols using a safer approach
+/// Combine data from a batch of symbols by aligning to a common timeline
 fn combine_batch_data(batch_data: Vec<DataFrame>) -> Result<DataFrame> {
     if batch_data.is_empty() {
         anyhow::bail!("No data to combine in batch");
@@ -180,79 +170,137 @@ fn combine_batch_data(batch_data: Vec<DataFrame>) -> Result<DataFrame> {
 
     println!("    Combining {} DataFrames in batch...", batch_data.len());
 
-    // Get the common timeline from the first DataFrame
-    let timeline = batch_data[0].select(["datetime"])?.clone();
-    println!("    Timeline has {} rows", timeline.height());
-
-    // Collect all return columns from all DataFrames
-    let mut all_return_columns: Vec<polars::prelude::Column> = Vec::new();
+    // Create a unified timeline by collecting all unique timestamps
+    let mut all_timestamps: Vec<i64> = Vec::new();
 
     for (i, df) in batch_data.iter().enumerate() {
-        println!("    Processing DataFrame {} with {} rows and {} columns",
-                 i + 1, df.height(), df.width());
+        println!("    DataFrame {} has {} rows", i + 1, df.height());
 
-        // Get all columns except datetime
-        for column in df.get_columns() {
-            if column.name() != "datetime" {
-                // Ensure the column has the same length as timeline
-                if column.len() != timeline.height() {
-                    return Err(anyhow::anyhow!(
-                        "Column {} has {} rows but timeline has {} rows",
-                        column.name(), column.len(), timeline.height()
-                    ));
-                }
-                all_return_columns.push(column.clone());
-            }
-        }
+        // Extract timestamps as i64 (milliseconds)
+        let timestamps = df
+            .column("datetime")?
+            .datetime()?
+            .as_datetime_iter()
+            .map(|opt_dt| opt_dt.map(|dt| dt.and_utc().timestamp_millis()).unwrap_or(0))
+            .collect::<Vec<_>>();
+
+        all_timestamps.extend(timestamps);
     }
 
-    // Combine timeline with all return columns
-    let combined = if all_return_columns.is_empty() {
-        timeline
-    } else {
-        timeline.hstack(&all_return_columns)
-            .map_err(|e| anyhow::anyhow!("Failed to combine columns: {}", e))?
-    };
+    // Remove duplicates and sort to create unified timeline
+    all_timestamps.sort_unstable();
+    all_timestamps.dedup();
+
+    println!("    Created unified timeline with {} unique timestamps", all_timestamps.len());
+
+    // Convert back to datetime column using Series
+    let datetime_series = polars::prelude::Series::new(
+        "datetime".into(),
+        all_timestamps.clone()
+    ).cast(&DataType::Datetime(TimeUnit::Milliseconds, None))?;
+
+    let unified_timeline = DataFrame::new(vec![datetime_series.into()])?;
+
+    // Now join each DataFrame to this unified timeline
+    let mut result = unified_timeline;
+
+    for (i, df) in batch_data.into_iter().enumerate() {
+        println!("    Joining DataFrame {} to unified timeline...", i + 1);
+
+        result = result
+            .lazy()
+            .join(
+                df.lazy(),
+                [col("datetime")],
+                [col("datetime")],
+                JoinArgs::new(JoinType::Left), // Left join to keep all timeline entries
+            )
+            .collect()?;
+    }
+
+    // Fill nulls with 0.0 for missing return values
+    let result = result
+        .lazy()
+        .with_columns([all().fill_null(lit(0.0f64))])
+        .collect()?;
 
     println!("    ✓ Combined into DataFrame with {} rows and {} columns",
-             combined.height(), combined.width());
+             result.height(), result.width());
 
-    Ok(combined)
+    Ok(result)
 }
 
-/// Combine all batches into the final dataset
-fn combine_all_batches(all_batches: Vec<DataFrame>, timeline: DataFrame) -> Result<DataFrame> {
-    // Start with just the return columns (no datetime)
-    let mut all_return_columns: Vec<polars::prelude::Column> = Vec::new();
+/// Combine all batches into the final dataset using timeline alignment
+fn combine_all_batches(all_batches: Vec<DataFrame>, _timeline: DataFrame) -> Result<DataFrame> {
+    if all_batches.is_empty() {
+        anyhow::bail!("No batches to combine");
+    }
 
-    // Extract all return columns from all batches
+    if all_batches.len() == 1 {
+        let mut result = all_batches.into_iter().next().unwrap();
+        // Remove datetime column for model input
+        result = result.drop("datetime")?;
+        return Ok(result);
+    }
+
+    println!("  Creating unified timeline from all {} batches...", all_batches.len());
+
+    // Create a unified timeline by collecting all unique timestamps from all batches
+    let mut all_timestamps: Vec<i64> = Vec::new();
+
+    for (i, batch_df) in all_batches.iter().enumerate() {
+        println!("    Batch {} has {} rows", i + 1, batch_df.height());
+
+        // Extract timestamps as i64 (milliseconds)
+        let timestamps = batch_df
+            .column("datetime")?
+            .datetime()?
+            .as_datetime_iter()
+            .map(|opt_dt| opt_dt.map(|dt| dt.and_utc().timestamp_millis()).unwrap_or(0))
+            .collect::<Vec<_>>();
+
+        all_timestamps.extend(timestamps);
+    }
+
+    // Remove duplicates and sort to create unified timeline
+    all_timestamps.sort_unstable();
+    all_timestamps.dedup();
+
+    println!("    Created unified timeline with {} unique timestamps", all_timestamps.len());
+
+    // Convert back to datetime column using Series
+    let datetime_series = polars::prelude::Series::new(
+        "datetime".into(),
+        all_timestamps.clone()
+    ).cast(&DataType::Datetime(TimeUnit::Milliseconds, None))?;
+
+    let mut unified_timeline = DataFrame::new(vec![datetime_series.into()])?;
+
+    // Now join each batch to this unified timeline
     for (i, batch_df) in all_batches.into_iter().enumerate() {
-        println!("  Extracting columns from batch {} data...", i + 1);
+        println!("    Joining batch {} to unified timeline...", i + 1);
 
-        // Get all columns except datetime
-        for column in batch_df.get_columns() {
-            if column.name() != "datetime" {
-                all_return_columns.push(column.clone());
-            }
-        }
+        unified_timeline = unified_timeline
+            .lazy()
+            .join(
+                batch_df.lazy(),
+                [col("datetime")],
+                [col("datetime")],
+                JoinArgs::new(JoinType::Left), // Left join to keep all timeline entries
+            )
+            .collect()?;
     }
 
-    // Create final dataframe by combining timeline with all return columns
-    println!("  Combining {} return columns with timeline...", all_return_columns.len());
-    let mut final_df = timeline;
-
-    // Add all return columns at once
-    if !all_return_columns.is_empty() {
-        final_df = final_df.hstack(&all_return_columns)?;
-    }
-
-    // Fill nulls and clean up
-    let final_df = final_df
+    // Fill nulls with 0.0 for missing return values and clean up
+    let final_df = unified_timeline
         .lazy()
         .sort(["datetime"], SortMultipleOptions::default())
         .with_columns([all().fill_null(lit(0.0f64))])
         .drop(["datetime"]) // Remove timestamp for model input
         .collect()?;
+
+    println!("    ✓ Final dataset has {} rows and {} columns",
+             final_df.height(), final_df.width());
 
     Ok(final_df)
 }
@@ -318,11 +366,16 @@ fn main() -> Result<()> {
         if !existing_batches.is_empty() {
             println!("🔄 Using {} existing batch files, combining them...", existing_batches.len());
 
-            // Create a simple timeline from the first batch
-            let timeline = existing_batches[0].select(["datetime"])?.clone();
+            // Show batch sizes for info
+            for (i, batch) in existing_batches.iter().enumerate() {
+                println!("  Batch {}: {} rows, {} columns", i + 1, batch.height(), batch.width());
+            }
 
-            // Combine all existing batches
-            let final_df = combine_all_batches(existing_batches, timeline)?;
+            // Create a dummy timeline (will be replaced by unified timeline in combine_all_batches)
+            let dummy_timeline = existing_batches[0].select(["datetime"])?.clone();
+
+            // Combine all existing batches (handles mismatched timelines automatically)
+            let final_df = combine_all_batches(existing_batches, dummy_timeline)?;
 
             // Save the final dataset
             println!(
