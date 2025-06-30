@@ -35,7 +35,7 @@ pub fn create_dataset(
         for symbol in symbol_batch {
             let symbol_dir = raw_data_dir.join(symbol);
             if !symbol_dir.exists() {
-                eprintln!("Warning: Directory not found for symbol {}, skipping.", symbol);
+                eprintln!("  ⚠️  Directory not found for symbol {}, skipping.", symbol);
                 continue;
             }
 
@@ -44,33 +44,65 @@ pub fn create_dataset(
             // Load and process the symbol's data
             match process_single_symbol(&symbol_dir, symbol) {
                 Ok(df) => {
+                    // Validate DataFrame structure
+                    if df.width() != 2 {
+                        eprintln!("  ⚠️  Unexpected DataFrame structure for {}: {} columns (expected 2)",
+                                 symbol, df.width());
+                        continue;
+                    }
+
                     // Extract timeline from first symbol if we don't have one yet
                     if common_timeline.is_none() {
-                        common_timeline = Some(df.select(["datetime"])?.clone());
+                        let timeline = df.select(["datetime"])?.clone();
+                        println!("  📅 Using {} as timeline reference ({} rows)", symbol, timeline.height());
+                        common_timeline = Some(timeline);
                     }
                     batch_data.push(df);
                 }
                 Err(e) => {
-                    eprintln!("Error processing {}: {}", symbol, e);
+                    eprintln!("  ❌ Error processing {}: {}", symbol, e);
                     continue;
                 }
             }
         }
 
         if !batch_data.is_empty() {
+            println!("  Combining {} symbols in batch {}...", batch_data.len(), batch_idx + 1);
+
+            // Validate that all DataFrames have the same number of rows
+            let expected_rows = batch_data[0].height();
+            let mut all_same_size = true;
+            for (i, df) in batch_data.iter().enumerate() {
+                if df.height() != expected_rows {
+                    eprintln!("  ⚠️  DataFrame {} has {} rows, expected {}", i, df.height(), expected_rows);
+                    all_same_size = false;
+                }
+            }
+
+            if !all_same_size {
+                eprintln!("  ❌ Skipping batch {} due to mismatched DataFrame sizes", batch_idx + 1);
+                continue;
+            }
+
             // Combine batch data
-            let batch_combined = combine_batch_data(batch_data)?;
+            match combine_batch_data(batch_data) {
+                Ok(batch_combined) => {
+                    // Save intermediate batch result
+                    let batch_file = output_path.parent().unwrap().join(format!("batch_{}.parquet", batch_idx + 1));
+                    let mut file = fs::File::create(&batch_file)?;
+                    ParquetWriter::new(&mut file)
+                        .with_compression(ParquetCompression::Snappy)
+                        .finish(&mut batch_combined.clone())?;
+                    println!("  💾 Saved batch {} to: {}", batch_idx + 1, batch_file.display());
 
-            // Save intermediate batch result
-            let batch_file = output_path.parent().unwrap().join(format!("batch_{}.parquet", batch_idx + 1));
-            let mut file = fs::File::create(&batch_file)?;
-            ParquetWriter::new(&mut file)
-                .with_compression(ParquetCompression::Snappy)
-                .finish(&mut batch_combined.clone())?;
-            println!("  💾 Saved batch {} to: {}", batch_idx + 1, batch_file.display());
-
-            all_return_data.push(batch_combined);
-            println!("  ✓ Batch {} processed successfully", batch_idx + 1);
+                    all_return_data.push(batch_combined);
+                    println!("  ✅ Batch {} processed successfully", batch_idx + 1);
+                }
+                Err(e) => {
+                    eprintln!("  ❌ Failed to combine batch {}: {}", batch_idx + 1, e);
+                    continue;
+                }
+            }
         }
     }
 
@@ -99,13 +131,14 @@ pub fn create_dataset(
 
 /// Process a single symbol and return its data with returns calculated
 fn process_single_symbol(symbol_dir: &Path, symbol: &str) -> Result<DataFrame> {
-    // Scan all yearly Parquet files in the symbol's directory
-    let raw_df = LazyFrame::scan_parquet(
-        symbol_dir.join("*.parquet").to_str().unwrap(),
-        Default::default(),
-    )?;
+    // Check if directory has any parquet files
+    let parquet_pattern = symbol_dir.join("*.parquet");
+    let parquet_path = parquet_pattern.to_str().unwrap();
 
-    // Process data and calculate returns
+    // Scan all yearly Parquet files in the symbol's directory
+    let raw_df = LazyFrame::scan_parquet(parquet_path, Default::default())?;
+
+    // Process data and calculate returns with better error handling
     let processed_df = raw_df
         // Convert Unix ms timestamp to Polars Datetime
         .with_column(
@@ -115,20 +148,28 @@ fn process_single_symbol(symbol_dir: &Path, symbol: &str) -> Result<DataFrame> {
         )
         // Sort by timestamp to ensure proper ordering
         .sort(["datetime"], SortMultipleOptions::default())
-        // Calculate percentage return based on close prices
+        // Calculate percentage return based on close prices, handling potential nulls
         .with_column(
             ((col("close") - col("close").shift(lit(1))) / col("close").shift(lit(1)))
+                .fill_null(lit(0.0f64))  // Fill NaN/null returns with 0
                 .alias(&format!("{}_return", symbol)),
         )
         // Keep only the timestamp and the new return column
         .select([col("datetime"), col(&format!("{}_return", symbol))])
-        .collect()?;
+        .collect()
+        .map_err(|e| anyhow::anyhow!("Failed to process symbol {}: {}", symbol, e))?;
 
+    // Validate the result
+    if processed_df.height() == 0 {
+        return Err(anyhow::anyhow!("No data found for symbol {}", symbol));
+    }
+
+    println!("    ✓ Processed {} rows for {}", processed_df.height(), symbol);
     Ok(processed_df)
 }
 
-/// Combine data from a batch of symbols
-fn combine_batch_data(mut batch_data: Vec<DataFrame>) -> Result<DataFrame> {
+/// Combine data from a batch of symbols using a safer approach
+fn combine_batch_data(batch_data: Vec<DataFrame>) -> Result<DataFrame> {
     if batch_data.is_empty() {
         anyhow::bail!("No data to combine in batch");
     }
@@ -137,19 +178,44 @@ fn combine_batch_data(mut batch_data: Vec<DataFrame>) -> Result<DataFrame> {
         return Ok(batch_data.into_iter().next().unwrap());
     }
 
-    // Start with the first dataframe
-    let mut combined = batch_data.remove(0);
+    println!("    Combining {} DataFrames in batch...", batch_data.len());
 
-    // Join the rest
-    for df in batch_data {
-        combined = combined.join(
-            &df,
-            ["datetime"],
-            ["datetime"],
-            JoinArgs::new(JoinType::Full),
-            None,
-        )?;
+    // Get the common timeline from the first DataFrame
+    let timeline = batch_data[0].select(["datetime"])?.clone();
+    println!("    Timeline has {} rows", timeline.height());
+
+    // Collect all return columns from all DataFrames
+    let mut all_return_columns: Vec<polars::prelude::Column> = Vec::new();
+
+    for (i, df) in batch_data.iter().enumerate() {
+        println!("    Processing DataFrame {} with {} rows and {} columns",
+                 i + 1, df.height(), df.width());
+
+        // Get all columns except datetime
+        for column in df.get_columns() {
+            if column.name() != "datetime" {
+                // Ensure the column has the same length as timeline
+                if column.len() != timeline.height() {
+                    return Err(anyhow::anyhow!(
+                        "Column {} has {} rows but timeline has {} rows",
+                        column.name(), column.len(), timeline.height()
+                    ));
+                }
+                all_return_columns.push(column.clone());
+            }
+        }
     }
+
+    // Combine timeline with all return columns
+    let combined = if all_return_columns.is_empty() {
+        timeline
+    } else {
+        timeline.hstack(&all_return_columns)
+            .map_err(|e| anyhow::anyhow!("Failed to combine columns: {}", e))?
+    };
+
+    println!("    ✓ Combined into DataFrame with {} rows and {} columns",
+             combined.height(), combined.width());
 
     Ok(combined)
 }
