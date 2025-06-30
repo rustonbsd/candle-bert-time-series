@@ -659,7 +659,7 @@ fn main() -> Result<()> {
     println!("Using {} CPU cores for parallel processing", num_cores);
 
     // --- Configuration ---
-    let output_dir = PathBuf::from("./crypto_data");
+    let output_dir = PathBuf::from("/mnt/storage-box/crypto_data_k_lines/1m");
     let pairlist_file = "pairlist.txt";
     const CONCURRENT_JOBS: usize = 5; // Process 5 pairs concurrently
 
