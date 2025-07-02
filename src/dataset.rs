@@ -3,7 +3,7 @@ use polars::prelude::*;
 
 /// Inspects a Parquet file to show its structure without loading all data
 pub fn inspect_parquet_file(path: &str) -> Result<()> {
-    println!("🔍 Inspecting Parquet file: {}", path);
+    println!("Inspecting Parquet file: {}", path);
 
     let df = LazyFrame::scan_parquet(path, Default::default())
         .map_err(|e| candle_core::Error::Msg(format!("Failed to scan Parquet file: {}", e)))?
@@ -11,16 +11,16 @@ pub fn inspect_parquet_file(path: &str) -> Result<()> {
         .collect()
         .map_err(|e| candle_core::Error::Msg(format!("Failed to collect LazyFrame: {}", e)))?;
 
-    println!("📊 File structure:");
+    println!("File structure:");
     println!("   Rows: {} (showing first 5)", df.height());
     println!("   Columns: {}", df.width());
 
-    println!("\n📋 Column names and types:");
+    println!("\nColumn names and types:");
     for (i, (name, dtype)) in df.get_column_names().iter().zip(df.dtypes().iter()).enumerate() {
         println!("   {}: {} ({})", i + 1, name, dtype);
     }
 
-    println!("\n📈 Sample data (first 5 rows):");
+    println!("\nSample data (first 5 rows):");
     println!("{}", df);
 
     Ok(())

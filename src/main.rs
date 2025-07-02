@@ -1,6 +1,7 @@
 // main.rs
 pub mod dataset;
 mod financial_bert;
+use candle_bert_time_series::batcher::Batcher;
 use dataset::load_and_prepare_data;
 use financial_bert::{Config, FinancialTransformerForMaskedRegression};
 
@@ -9,9 +10,9 @@ use candle_nn::{loss, Optimizer, VarBuilder, VarMap};
 
 // --- Configuration ---
 // NUM_TIME_SERIES will be determined dynamically from the data
-const SEQUENCE_LENGTH: usize = 64;
+const SEQUENCE_LENGTH: usize = 120;
 const MODEL_DIMS: usize = 256;
-const NUM_LAYERS: usize = 4;
+const NUM_LAYERS: usize = 6;
 const NUM_HEADS: usize = 8;
 const NUM_EPOCHS: usize = 50;
 const LEARNING_RATE: f64 = 1e-4;
@@ -23,31 +24,24 @@ const DATA_PATH: &str = "/home/i3/Downloads/transformed_dataset.parquet";
 
 // --- Data Generation and Preparation ---
 
-/// This function is correct. It produces a 2D tensor.
-/// Shape: [timesteps, num_time_series] -> e.g., [1024, 100]
-fn generate_dummy_data(timesteps: usize, num_time_series: usize, device: &Device) -> Result<Tensor> {
-    Tensor::randn(0f32, 0.02f32, (timesteps, num_time_series), device)
-}
-
-/// Corrected and simplified masking function.
+/// Corrected and simplified masking function for 3D batched input.
 fn mask_data(
-    input: &Tensor, // Expects a 2D tensor: [SEQUENCE_LENGTH, NUM_TIME_SERIES] -> [64, 100]
+    input: &Tensor, // Expects a 3D tensor: [BATCH_SIZE, SEQUENCE_LENGTH, NUM_TIME_SERIES] -> [32, 120, 190]
     device: &Device,
 ) -> Result<(Tensor, Tensor, Tensor)> {
     let shape = input.shape();
     let rand_mask = Tensor::rand(0f32, 1f32, shape, device)?;
-    // `mask` is a boolean tensor of shape [64, 100]
+    // `mask` is a boolean tensor of shape [32, 120, 190]
     let mask = (rand_mask.lt(MASK_PROB))?;
     let zeros = Tensor::zeros(shape, input.dtype(), device)?;
 
     // `masked_select` correctly gathers only the masked values into a 1D tensor.
-    // Shape: [num_masked_elements]
+    // Shape: [num_masked_elements] (flattened from all batch elements)
     let true_labels = mask.where_cond(input, &zeros)?;
 
     // Zero out the values in the input where the mask is true.
     // This preserves the original shape of the input.
-    // Shape: [64, 100]
-    //let masked_input = input.broadcast_mul(&mask.logical_not()?.to_dtype(DType::F32)?)?;
+    // Shape: [32, 120, 190]
     // 1. Create a tensor of ones with the same shape as the mask.
     //    The `lt` operation produces a U8 tensor, so we use DType::U8.
     let ones = Tensor::ones(shape, DType::U8, device)?;
@@ -66,10 +60,13 @@ fn main() -> Result<()> {
     println!("Training on device: {:?}", device);
 
     // --- Data Loading First to Determine Dimensions ---
-    println!("📊 Loading cryptocurrency data...");
+    println!("Loading cryptocurrency data...");
     let (full_data_sequence, num_time_series) = load_and_prepare_data(DATA_PATH, &device)?;
+    let total_timesteps = full_data_sequence.dims()[0];
+    let train_split = (total_timesteps as f32 * 0.8) as usize;
+    let train_data = full_data_sequence.narrow(0, 0, train_split)?;
 
-    println!("✅ Detected {} cryptocurrencies in the dataset", num_time_series);
+    println!("Detected {} cryptocurrencies in the dataset", num_time_series);
 
     // --- Model and Optimizer Setup ---
     let config = Config {
@@ -97,38 +94,34 @@ fn main() -> Result<()> {
     };
     let mut optimizer = candle_nn::AdamW::new(varmap.all_vars(), adamw_params)?;
 
-    println!("🚀 Starting training...");
+    println!("Starting training...");
     for epoch in 0..NUM_EPOCHS {
         // --- Batch Preparation ---
-        // `batch` Shape: [64, 190] (A 2D slice of the full data)
-        let batch = full_data_sequence.narrow(0, 0, SEQUENCE_LENGTH)?;
+        // `batch` Shape: [BATCH_SIZE, SEQUENCE_LENGTH, NUM_TIME_SERIES] -> [32, 120, 190]
+        let batch = Batcher::new(&train_data, SEQUENCE_LENGTH, BATCH_SIZE).next().ok_or_else(|| candle_core::Error::Msg("No batch available".to_string()))??;
 
-        // `masked_input` Shape: [64, 190]
-        // `true_labels` Shape: [num_masked] (1D)
-        // `mask` Shape: [64, 190] (boolean)
+        // `masked_input` Shape: [32, 120, 190]
+        // `true_labels` Shape: [num_masked] (1D, flattened from all batch elements)
+        // `mask` Shape: [32, 120, 190] (boolean)
         let (masked_input, true_labels, mask) = mask_data(&batch, &device)?;
 
         // --- FORWARD PASS ---
         // The model expects a 3D tensor: (batch_size, seq_len, features).
-        // We add a batch dimension of 1.
-        // `model_input` Shape: [64, 190] -> [1, 64, 190]
-        let model_input = masked_input.unsqueeze(0)?;
+        // The batch is already properly shaped, no need to unsqueeze.
+        // `model_input` Shape: [32, 120, 190]
+        let model_input = masked_input;
 
         // `predictions` will have the same shape as the input.
-        // `predictions` Shape: [1, 64, 190]
+        // `predictions` Shape: [32, 120, 190]
         let predictions = model.forward(&model_input)?;
 
         // --- LOSS CALCULATION ---
         // To compare with our labels, we must isolate the predictions at the masked positions.
-        // First, remove the batch dimension.
-        // `predictions_squeezed` Shape: [1, 64, 190] -> [64, 190]
-        let predictions_squeezed = predictions.squeeze(0)?;
-
-        // Now, use the same boolean mask to select the predicted values.
+        // Use the same boolean mask to select the predicted values.
         // This flattens the tensor, matching the shape of `true_labels`.
-        // `predicted_values` Shape: [num_masked] (1D)
-        let zeros = Tensor::zeros(predictions_squeezed.shape(), predictions_squeezed.dtype(), &device)?;
-        let predicted_values = mask.where_cond(&predictions_squeezed, &zeros)?;
+        // `predicted_values` Shape: [num_masked] (1D, flattened from all batch elements)
+        let zeros = Tensor::zeros(predictions.shape(), predictions.dtype(), &device)?;
+        let predicted_values = mask.where_cond(&predictions, &zeros)?;
 
         // Now we can compare the two 1D tensors.
         let loss = loss::mse(&predicted_values, &true_labels)?;
@@ -141,6 +134,11 @@ fn main() -> Result<()> {
             epoch,
             loss.to_scalar::<f32>()?
         );
+
+        // Save model checkpoint after each epoch
+        let checkpoint_path = format!("current_model.safetensors");
+        varmap.save(&checkpoint_path)?;
+        println!("Saved checkpoint to: {}", checkpoint_path);
     }
 
     Ok(())
