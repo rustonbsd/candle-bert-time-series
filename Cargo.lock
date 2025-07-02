@@ -377,6 +377,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tracing",
  "walkdir",
  "zip 4.2.0",
