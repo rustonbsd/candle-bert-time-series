@@ -53,6 +53,42 @@ fn mask_data(
     Ok((masked_input, true_labels, mask))
 }
 
+/// Evaluate the model on a dataset (validation or test) without updating weights
+fn evaluate_model(
+    model: &FinancialTransformerForMaskedRegression,
+    data: &Tensor,
+    device: &Device,
+    dataset_name: &str,
+) -> Result<f32> {
+    let mut total_loss = 0.0;
+    let mut batch_count = 0;
+
+    let mut batcher = Batcher::new(data, SEQUENCE_LENGTH, BATCH_SIZE);
+
+    while let Some(batch_result) = batcher.next() {
+        let batch = batch_result?;
+
+        // Apply masking
+        let (masked_input, true_labels, mask) = mask_data(&batch, device)?;
+
+        // Forward pass (no gradient computation needed for evaluation)
+        let predictions = model.forward(&masked_input)?;
+
+        // Calculate loss
+        let zeros = Tensor::zeros(predictions.shape(), predictions.dtype(), device)?;
+        let predicted_values = mask.where_cond(&predictions, &zeros)?;
+        let loss = loss::mse(&predicted_values, &true_labels)?;
+
+        total_loss += loss.to_scalar::<f32>()?;
+        batch_count += 1;
+    }
+
+    let avg_loss = if batch_count > 0 { total_loss / batch_count as f32 } else { 0.0 };
+    println!("  {} Loss: {:.10} (averaged over {} batches)", dataset_name, avg_loss, batch_count);
+
+    Ok(avg_loss)
+}
+
 // --- The Main Training Function ---
 
 fn main() -> Result<()> {
@@ -63,8 +99,17 @@ fn main() -> Result<()> {
     println!("Loading cryptocurrency data...");
     let (full_data_sequence, num_time_series) = load_and_prepare_data(DATA_PATH, &device)?;
     let total_timesteps = full_data_sequence.dims()[0];
-    let train_split = (total_timesteps as f32 * 0.8) as usize;
+
+    // Split data into train (70%), validation (15%), test (15%)
+    let train_split = (total_timesteps as f32 * 0.7) as usize;
+    let val_split = (total_timesteps as f32 * 0.85) as usize;
+
     let train_data = full_data_sequence.narrow(0, 0, train_split)?;
+    let val_data = full_data_sequence.narrow(0, train_split, val_split - train_split)?;
+    let test_data = full_data_sequence.narrow(0, val_split, total_timesteps - val_split)?;
+
+    println!("Data splits - Train: {}, Validation: {}, Test: {}",
+             train_data.dims()[0], val_data.dims()[0], test_data.dims()[0]);
 
     println!("Detected {} cryptocurrencies in the dataset", num_time_series);
 
@@ -94,52 +139,96 @@ fn main() -> Result<()> {
     };
     let mut optimizer = candle_nn::AdamW::new(varmap.all_vars(), adamw_params)?;
 
+
+
+    // --- Validate ---
+    println!("Running test...");    
+    let train_loss = evaluate_model(&model, &train_data, &device, "Train")?;
+    let val_loss = evaluate_model(&model, &val_data, &device, "Val")?;
+
+    // --- Pre SUMMARY ---
+    println!("  Train Loss: {:.10}", train_loss);
+    println!("  Val Loss:   {:.10}", val_loss);
+
     println!("Starting training...");
     for epoch in 0..NUM_EPOCHS {
-        // --- Batch Preparation ---
-        // `batch` Shape: [BATCH_SIZE, SEQUENCE_LENGTH, NUM_TIME_SERIES] -> [32, 120, 190]
-        let batch = Batcher::new(&train_data, SEQUENCE_LENGTH, BATCH_SIZE).next().ok_or_else(|| candle_core::Error::Msg("No batch available".to_string()))??;
+        println!("\n--- Epoch {} ---", epoch + 1);
 
-        // `masked_input` Shape: [32, 120, 190]
-        // `true_labels` Shape: [num_masked] (1D, flattened from all batch elements)
-        // `mask` Shape: [32, 120, 190] (boolean)
-        let (masked_input, true_labels, mask) = mask_data(&batch, &device)?;
+        // --- TRAINING PHASE: Process all batches in the training set ---
+        let mut epoch_train_loss = 0.0;
+        let mut train_batch_count = 0;
 
-        // --- FORWARD PASS ---
-        // The model expects a 3D tensor: (batch_size, seq_len, features).
-        // The batch is already properly shaped, no need to unsqueeze.
-        // `model_input` Shape: [32, 120, 190]
-        let model_input = masked_input;
+        let mut train_batcher = Batcher::new(&train_data, SEQUENCE_LENGTH, BATCH_SIZE);
 
-        // `predictions` will have the same shape as the input.
-        // `predictions` Shape: [32, 120, 190]
-        let predictions = model.forward(&model_input)?;
+        while let Some(batch_result) = train_batcher.next() {
+            let batch = batch_result?;
 
-        // --- LOSS CALCULATION ---
-        // To compare with our labels, we must isolate the predictions at the masked positions.
-        // Use the same boolean mask to select the predicted values.
-        // This flattens the tensor, matching the shape of `true_labels`.
-        // `predicted_values` Shape: [num_masked] (1D, flattened from all batch elements)
-        let zeros = Tensor::zeros(predictions.shape(), predictions.dtype(), &device)?;
-        let predicted_values = mask.where_cond(&predictions, &zeros)?;
+            // `masked_input` Shape: [32, 120, 190]
+            // `true_labels` Shape: [num_masked] (1D, flattened from all batch elements)
+            // `mask` Shape: [32, 120, 190] (boolean)
+            let (masked_input, true_labels, mask) = mask_data(&batch, &device)?;
 
-        // Now we can compare the two 1D tensors.
-        let loss = loss::mse(&predicted_values, &true_labels)?;
+            // --- FORWARD PASS ---
+            // The model expects a 3D tensor: (batch_size, seq_len, features).
+            // The batch is already properly shaped, no need to unsqueeze.
+            // `model_input` Shape: [32, 120, 190]
+            let model_input = masked_input;
 
-        // --- BACKWARD PASS ---
-        optimizer.backward_step(&loss)?;
+            // `predictions` will have the same shape as the input.
+            // `predictions` Shape: [32, 120, 190]
+            let predictions = model.forward(&model_input)?;
 
-        println!(
-            "Epoch: {:4} | Loss: {:8.5}",
-            epoch,
-            loss.to_scalar::<f32>()?
-        );
+            // --- LOSS CALCULATION ---
+            // To compare with our labels, we must isolate the predictions at the masked positions.
+            // Use the same boolean mask to select the predicted values.
+            // This flattens the tensor, matching the shape of `true_labels`.
+            // `predicted_values` Shape: [num_masked] (1D, flattened from all batch elements)
+            let zeros = Tensor::zeros(predictions.shape(), predictions.dtype(), &device)?;
+            let predicted_values = mask.where_cond(&predictions, &zeros)?;
+
+            // Now we can compare the two 1D tensors.
+            let loss = loss::mse(&predicted_values, &true_labels)?;
+
+            // --- BACKWARD PASS ---
+            optimizer.backward_step(&loss)?;
+
+            // Accumulate training loss
+            epoch_train_loss += loss.to_scalar::<f32>()?;
+            train_batch_count += 1;
+        }
+
+        // Calculate average training loss for this epoch
+        let avg_train_loss = if train_batch_count > 0 {
+            epoch_train_loss / train_batch_count as f32
+        } else {
+            0.0
+        };
+
+        println!("Training completed: {} batches processed", train_batch_count);
+        println!("  Training Loss: {:.10} (averaged over {} batches)", avg_train_loss, train_batch_count);
+
+        // --- VALIDATION PHASE ---
+        println!("Running validation...");
+        let val_loss = evaluate_model(&model, &val_data, &device, "Validation")?;
+
+        // --- EPOCH SUMMARY ---
+        println!("Epoch {} Summary:", epoch + 1);
+        println!("  Train Loss: {:.10}", avg_train_loss);
+        println!("  Val Loss:   {:.10}", val_loss);
 
         // Save model checkpoint after each epoch
         let checkpoint_path = format!("current_model.safetensors");
         varmap.save(&checkpoint_path)?;
         println!("Saved checkpoint to: {}", checkpoint_path);
     }
+
+    // --- TEST PHASE ---
+    println!("Running test...");
+    let test_loss = evaluate_model(&model, &test_data, &device, "Test")?;
+
+    // --- Final SUMMARY ---
+    println!("  Val Loss:   {:.10}", val_loss);
+    println!("  Test Loss:  {:.10}", test_loss);
 
     Ok(())
 }
