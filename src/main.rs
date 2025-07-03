@@ -1,6 +1,8 @@
 // main.rs
 pub mod dataset;
 mod financial_bert;
+use std::process::exit;
+
 use candle_bert_time_series::batcher::Batcher;
 use dataset::load_and_prepare_data;
 use financial_bert::{Config, FinancialTransformerForMaskedRegression};
@@ -53,12 +55,65 @@ fn mask_data(
     Ok((masked_input, true_labels, mask))
 }
 
+fn mask_data_last_col(
+    input: &Tensor, // Expects a 3D tensor: [BATCH_SIZE, SEQUENCE_LENGTH, NUM_TIME_SERIES] -> [32, 120, 190]
+    device: &Device,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let shape = input.shape();
+
+    // Create mask only for the newest minute (last time step in sequence)
+    // Shape: [batch_size, 1, num_time_series] -> [32, 1, 190]
+    let last_timestep_shape = &[shape.dims()[0], 1, shape.dims()[2]];
+    let last_timestep_mask = Tensor::ones(last_timestep_shape, DType::F32, device)?;
+
+    // Create full mask tensor with zeros everywhere except the last timestep
+    let mut full_mask = Tensor::zeros(shape, DType::F32, device)?;
+    // Set the last timestep (index 119 for sequence length 120) to our random mask
+    let last_idx = shape.dims()[1] - 1; // 119 for sequence length 120
+
+    // Use narrow and cat to insert the mask at the last timestep
+    let before_last = full_mask.narrow(1, 0, last_idx)?;
+    let after_last = if last_idx + 1 < shape.dims()[1] {
+        Some(full_mask.narrow(1, last_idx + 1, shape.dims()[1] - last_idx - 1)?)
+    } else {
+        None
+    };
+
+    full_mask = if let Some(after) = after_last {
+        Tensor::cat(&[&before_last, &last_timestep_mask, &after], 1)?
+    } else {
+        Tensor::cat(&[&before_last, &last_timestep_mask], 1)?
+    };
+
+    // Convert to U8 for boolean operations
+    let full_mask = full_mask.to_dtype(DType::U8)?;
+
+    let zeros = Tensor::zeros(shape, input.dtype(), device)?;
+
+    // `masked_select` correctly gathers only the masked values from the last timestep.
+    // Shape: [num_masked_elements] (only from the newest minute across all batches)
+    let true_labels = full_mask.where_cond(input, &zeros)?;
+
+    // Zero out the values in the input where the mask is true (only in the newest minute).
+    // This preserves the original shape of the input.
+    // Shape: [32, 120, 190]
+    // 1. Create a tensor of ones with the same shape as the full mask.
+    let ones = Tensor::ones(shape, DType::U8, device)?;
+    // 2. Subtract the mask from ones. If mask is [1, 0, 1], result is [0, 1, 0].
+    let inverted_mask = ones.sub(&full_mask)?;
+    // 3. Use this inverted mask to create the model input.
+    let masked_input = input.broadcast_mul(&inverted_mask.to_dtype(DType::F32)?)?;
+
+    Ok((masked_input, true_labels, full_mask))
+}
+
 /// Evaluate the model on a dataset (validation or test) without updating weights
 fn evaluate_model(
     model: &FinancialTransformerForMaskedRegression,
     data: &Tensor,
     device: &Device,
     dataset_name: &str,
+    masking_fn: fn(&Tensor, &Device) -> Result<(Tensor, Tensor, Tensor)>,
 ) -> Result<f32> {
     let mut total_loss = 0.0;
     let mut batch_count = 0;
@@ -129,10 +184,14 @@ fn main() -> Result<()> {
         use_cache: false,
         model_type: Some("financial_transformer".to_string()),
     };
-    let varmap = VarMap::new();
+    let mut varmap = VarMap::new();
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = FinancialTransformerForMaskedRegression::load(vb, &config)?;
 
+    let checkpoint_path = format!("current_model_ep35.safetensors");
+    varmap.load(checkpoint_path.clone())?;
+    println!("Loaded checkpoint: {}", checkpoint_path);
+    
     let adamw_params = candle_nn::ParamsAdamW {
         lr: LEARNING_RATE,
         ..Default::default()
@@ -141,14 +200,20 @@ fn main() -> Result<()> {
 
 
 
-    // --- Validate ---
+    
     println!("Running test...");    
-    let train_loss = evaluate_model(&model, &train_data, &device, "Train")?;
-    let val_loss = evaluate_model(&model, &val_data, &device, "Val")?;
+    let val_loss = evaluate_model(&model, &val_data, &device, "Val", mask_data_last_col)?;
+    println!("Last Col Val Loss:   {:.10}", val_loss);
+    let test_loss = evaluate_model(&model, &test_data, &device, "Test", mask_data_last_col)?;
+    println!("Last Col Test Loss: {:.10}", test_loss);
 
-    // --- Pre SUMMARY ---
-    println!("  Train Loss: {:.10}", train_loss);
-    println!("  Val Loss:   {:.10}", val_loss);
+    let val_loss = evaluate_model(&model, &val_data, &device, "Val", mask_data)?;
+    println!(" Val Loss:   {:.10}", val_loss);
+    let test_loss = evaluate_model(&model, &test_data, &device, "Test", mask_data)?;
+    println!(" Test Loss: {:.10}", test_loss);
+
+
+    return Ok(());
 
     println!("Starting training...");
     for epoch in 0..NUM_EPOCHS {
@@ -209,7 +274,7 @@ fn main() -> Result<()> {
 
         // --- VALIDATION PHASE ---
         println!("Running validation...");
-        let val_loss = evaluate_model(&model, &val_data, &device, "Validation")?;
+        let val_loss = evaluate_model(&model, &val_data, &device, "Validation", mask_data)?;
 
         // --- EPOCH SUMMARY ---
         println!("Epoch {} Summary:", epoch + 1);
@@ -224,11 +289,15 @@ fn main() -> Result<()> {
 
     // --- TEST PHASE ---
     println!("Running test...");
-    let test_loss = evaluate_model(&model, &test_data, &device, "Test")?;
+    let val_loss = evaluate_model(&model, &val_data, &device, "Val", mask_data_last_col)?;
+    println!("Last Col Val Loss:   {:.10}", val_loss);
+    let test_loss = evaluate_model(&model, &test_data, &device, "Test", mask_data_last_col)?;
+    println!("Last Col Test Loss: {:.10}", test_loss);
 
-    // --- Final SUMMARY ---
-    println!("  Val Loss:   {:.10}", val_loss);
-    println!("  Test Loss:  {:.10}", test_loss);
+    let val_loss = evaluate_model(&model, &val_data, &device, "Val", mask_data)?;
+    println!(" Val Loss:   {:.10}", val_loss);
+    let test_loss = evaluate_model(&model, &test_data, &device, "Test", mask_data)?;
+    println!(" Test Loss: {:.10}", test_loss);
 
     Ok(())
 }
