@@ -6,11 +6,13 @@ A comprehensive backtesting library for cryptocurrency trading strategies using 
 
 - **Realistic Trading Simulation**: Includes Binance maker/taker fees (0.1% default)
 - **Portfolio Management**: Tracks cash, positions, and portfolio value over time
+- **Leverage/Margin Support**: Optional negative cash allowance to see full P&L potential
 - **Performance Metrics**: Calculates comprehensive metrics including:
   - Total and annualized returns
   - Sharpe ratio
   - Maximum drawdown and duration
   - Win rate and profit factor
+  - Leverage and margin usage metrics
   - Trade statistics
 - **Flexible Data Format**: Works with percentage return data (no absolute prices needed)
 - **Memory Efficient**: Processes large datasets efficiently
@@ -63,12 +65,13 @@ let symbol_names: Vec<String> = (0..num_assets)
     .map(|i| format!("ASSET_{}", i))
     .collect();
 
-// Initialize backtester
-let mut backtester = Backtester::new(
+// Initialize backtester with leverage support
+let mut backtester = Backtester::new_with_leverage(
     100_000.0,  // $100k initial capital
     returns_data,
     symbol_names,
     Some(TradingFees::default()), // Binance fees
+    true, // Allow negative cash (leverage/margin)
 )?;
 
 // Run backtest
@@ -90,6 +93,67 @@ let metrics = backtester.calculate_metrics()?;
 println!("Total Return: {:.2}%", metrics.total_return * 100.0);
 println!("Sharpe Ratio: {:.3}", metrics.sharpe_ratio);
 println!("Max Drawdown: {:.2}%", metrics.max_drawdown * 100.0);
+```
+
+## Leverage and Margin Trading
+
+The backtesting library supports leverage/margin trading to show the full profit and loss potential of strategies without being limited by cash constraints.
+
+### Enabling Leverage
+
+```rust
+// Enable leverage (allow negative cash)
+let mut backtester = Backtester::new_with_leverage(
+    initial_capital,
+    returns_data,
+    symbol_names,
+    Some(fees),
+    true, // Allow negative cash
+)?;
+
+// Disable leverage (traditional cash-only trading)
+let mut backtester = Backtester::new_with_leverage(
+    initial_capital,
+    returns_data,
+    symbol_names,
+    Some(fees),
+    false, // Require positive cash
+)?;
+
+// Default constructor enables leverage
+let mut backtester = Backtester::new(/* ... */)?; // leverage = true
+```
+
+### Leverage Metrics
+
+When leverage is enabled, additional metrics are tracked:
+
+- **Max Leverage**: Highest leverage ratio achieved (position value / portfolio value)
+- **Max Margin Used**: Maximum amount of borrowed money (negative cash)
+- **Min Cash Balance**: Lowest cash balance reached (can be negative)
+- **Current Leverage**: Real-time leverage ratio in portfolio state
+
+### Benefits of Leverage Mode
+
+1. **See Full Strategy Potential**: No artificial stops due to cash constraints
+2. **Realistic P&L**: Shows what you would win or lose with sufficient capital
+3. **Risk Assessment**: Understand maximum leverage requirements
+4. **Strategy Comparison**: Compare strategies without capital limitations
+
+### Example Output with Leverage
+
+```
+📊 LEVERAGE & MARGIN METRICS
+Max Leverage Used: 3.45x
+Max Margin Used: $45,230.50
+Min Cash Balance: -$45,230.50
+  ⚠️  Strategy went into margin (negative cash)
+
+💼 FINAL PORTFOLIO
+Cash: -$12,450.30
+  ⚠️  NEGATIVE CASH (Margin used: $12,450.30)
+Total value: $87,549.70
+Current leverage: 1.14x
 ```
 
 ### Strategy Implementation

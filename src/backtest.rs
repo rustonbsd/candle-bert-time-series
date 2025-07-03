@@ -56,6 +56,8 @@ pub struct PortfolioState {
     pub total_value: f64,
     pub unrealized_pnl: f64,
     pub realized_pnl: f64,
+    pub leverage_ratio: f64, // Total position value / total portfolio value
+    pub margin_used: f64,    // Amount of borrowed money (negative cash)
 }
 
 /// Backtest performance metrics
@@ -71,6 +73,9 @@ pub struct PerformanceMetrics {
     pub total_trades: usize,
     pub total_fees: f64,
     pub final_portfolio_value: f64,
+    pub max_leverage: f64,
+    pub max_margin_used: f64,
+    pub min_cash_balance: f64,
 }
 
 /// Main backtesting engine
@@ -82,6 +87,7 @@ pub struct Backtester {
     pub symbol_names: Vec<String>,
     pub returns_data: Tensor, // [timesteps, num_assets] - percentage returns
     pub current_prices: Vec<f64>, // Reconstructed absolute prices for position tracking
+    pub allow_negative_cash: bool, // Allow leverage/margin trading
 }
 
 impl Backtester {
@@ -91,6 +97,17 @@ impl Backtester {
         returns_data: Tensor,
         symbol_names: Vec<String>,
         fees: Option<TradingFees>,
+    ) -> Result<Self> {
+        Self::new_with_leverage(initial_capital, returns_data, symbol_names, fees, true)
+    }
+
+    /// Create a new backtester instance with leverage control
+    pub fn new_with_leverage(
+        initial_capital: f64,
+        returns_data: Tensor,
+        symbol_names: Vec<String>,
+        fees: Option<TradingFees>,
+        allow_negative_cash: bool,
     ) -> Result<Self> {
         let fees = fees.unwrap_or_default();
         let num_assets = symbol_names.len();
@@ -106,6 +123,8 @@ impl Backtester {
             total_value: initial_capital,
             unrealized_pnl: 0.0,
             realized_pnl: 0.0,
+            leverage_ratio: 0.0,
+            margin_used: 0.0,
         };
 
         Ok(Self {
@@ -116,6 +135,7 @@ impl Backtester {
             symbol_names,
             returns_data,
             current_prices,
+            allow_negative_cash,
         })
     }
 
@@ -141,7 +161,9 @@ impl Backtester {
         match side {
             TradeSide::Buy => {
                 let total_cost = trade_value + fee;
-                if current_portfolio.cash < total_cost {
+
+                // Check cash constraint only if leverage is not allowed
+                if !self.allow_negative_cash && current_portfolio.cash < total_cost {
                     return Err(candle_core::Error::Msg("Insufficient cash for trade".to_string()));
                 }
 
@@ -224,7 +246,7 @@ impl Backtester {
             let current_price = self.current_prices[symbol_idx];
 
             position.current_value = position.quantity * current_price;
-            total_position_value += position.current_value;
+            total_position_value += position.current_value.abs(); // Use absolute value for leverage calculation
 
             let position_pnl = (current_price - position.entry_price) * position.quantity;
             unrealized_pnl += position_pnl;
@@ -232,6 +254,14 @@ impl Backtester {
 
         portfolio.total_value = portfolio.cash + total_position_value;
         portfolio.unrealized_pnl = unrealized_pnl;
+
+        // Calculate leverage and margin metrics
+        portfolio.margin_used = if portfolio.cash < 0.0 { -portfolio.cash } else { 0.0 };
+        portfolio.leverage_ratio = if portfolio.total_value.abs() > 1e-8 {
+            total_position_value / portfolio.total_value.abs()
+        } else {
+            0.0
+        };
     }
 
     /// Step forward one time period, updating prices based on returns
@@ -330,6 +360,17 @@ impl Backtester {
             f64::INFINITY
         };
 
+        // Calculate leverage and margin metrics
+        let max_leverage = self.portfolio_history.iter()
+            .map(|p| p.leverage_ratio)
+            .fold(0.0, f64::max);
+        let max_margin_used = self.portfolio_history.iter()
+            .map(|p| p.margin_used)
+            .fold(0.0, f64::max);
+        let min_cash_balance = self.portfolio_history.iter()
+            .map(|p| p.cash)
+            .fold(f64::INFINITY, f64::min);
+
         Ok(PerformanceMetrics {
             total_return,
             annualized_return,
@@ -341,6 +382,9 @@ impl Backtester {
             total_trades,
             total_fees,
             final_portfolio_value: final_value,
+            max_leverage,
+            max_margin_used,
+            min_cash_balance,
         })
     }
 

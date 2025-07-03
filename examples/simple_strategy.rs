@@ -151,12 +151,14 @@ fn run_backtest() -> Result<()> {
         .collect();
 
     // Initialize backtester with Binance fees using ONLY test data
+    // Allow negative cash (leverage/margin trading) to see full P&L potential
     let fees = TradingFees::default(); // 0.1% maker/taker fees
-    let mut backtester = Backtester::new(
+    let mut backtester = Backtester::new_with_leverage(
         initial_capital,
         test_data, // Only test split - no leakage!
         symbol_names,
         Some(fees),
+        true, // Allow negative cash - no "insufficient funds" errors
     )?;
 
     // Initialize strategy
@@ -171,6 +173,7 @@ fn run_backtest() -> Result<()> {
     println!("  - Lookback period: {} minutes", strategy.lookback_period);
     println!("  - Position size: {:.1}% per asset", strategy.position_size * 100.0);
     println!("  - Rebalance frequency: {} minutes", strategy.rebalance_frequency);
+    println!("  - Leverage allowed: YES (can go negative cash)");
 
     // Run backtest on TEST DATA ONLY
     let start_time = std::time::Instant::now();
@@ -222,10 +225,14 @@ fn run_backtest() -> Result<()> {
     println!("\n💼 FINAL PORTFOLIO");
     println!("{}", "=".repeat(60));
     println!("Cash: ${:.2}", final_portfolio.cash);
+    if final_portfolio.cash < 0.0 {
+        println!("  ⚠️  NEGATIVE CASH (Margin used: ${:.2})", final_portfolio.margin_used);
+    }
     println!("Positions: {}", final_portfolio.positions.len());
     println!("Total value: ${:.2}", final_portfolio.total_value);
     println!("Unrealized PnL: ${:.2}", final_portfolio.unrealized_pnl);
     println!("Realized PnL: ${:.2}", final_portfolio.realized_pnl);
+    println!("Current leverage: {:.2}x", final_portfolio.leverage_ratio);
 
     Ok(())
 }
@@ -243,11 +250,21 @@ fn display_performance_metrics(metrics: &PerformanceMetrics, initial_capital: f6
     println!("Profit Factor: {:.2}", metrics.profit_factor);
     println!("Total Trades: {}", metrics.total_trades);
     println!("Total Fees: ${:.2}", metrics.total_fees);
-    
+
+    // Leverage and margin metrics
+    println!("\n📊 LEVERAGE & MARGIN METRICS");
+    println!("Max Leverage Used: {:.2}x", metrics.max_leverage);
+    println!("Max Margin Used: ${:.2}", metrics.max_margin_used);
+    println!("Min Cash Balance: ${:.2}", metrics.min_cash_balance);
+    if metrics.min_cash_balance < 0.0 {
+        println!("  ⚠️  Strategy went into margin (negative cash)");
+    }
+
     // Risk-adjusted metrics
     let profit_loss = metrics.final_portfolio_value - initial_capital;
+    println!("\n📈 RISK-ADJUSTED METRICS");
     println!("Net Profit/Loss: ${:.2}", profit_loss);
-    
+
     if metrics.max_drawdown > 0.0 {
         let calmar_ratio = metrics.annualized_return / metrics.max_drawdown;
         println!("Calmar Ratio: {:.3}", calmar_ratio);
