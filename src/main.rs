@@ -156,6 +156,7 @@ fn main() -> Result<()> {
     let total_timesteps = full_data_sequence.dims()[0];
 
     // Split data into train (70%), validation (15%), test (15%)
+    // NOTE: This split logic is replicated in backtest::extract_test_split() to prevent data leakage
     let train_split = (total_timesteps as f32 * 0.7) as usize;
     let val_split = (total_timesteps as f32 * 0.85) as usize;
 
