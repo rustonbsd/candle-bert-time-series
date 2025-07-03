@@ -16,9 +16,10 @@ use financial_bert::{Config, FinancialTransformerForMaskedRegression};
 /// 1. At time T, feed the last 120 minutes of data to the model
 /// 2. Get model predictions for T+1 returns for all cryptocurrencies
 /// 3. Rank cryptocurrencies by predicted returns
-/// 4. Go long the top K assets with highest predicted returns
-/// 5. Stay in cash for all other assets (no short selling)
-/// 6. Hold positions for the next minute, then rebalance
+/// 4. Go long the top K assets with highest predicted returns (>0.5% only)
+/// 5. Only trade if predicted return > 0.5% (more than double trading fees)
+/// 6. Stay in cash for all other assets (no short selling)
+/// 7. Hold positions for the next minute, then rebalance
 struct ModelMomentumStrategy {
     model: FinancialTransformerForMaskedRegression,
     sequence_length: usize,
@@ -97,16 +98,17 @@ impl ModelMomentumStrategy {
         // Sort by prediction value (descending)
         pred_with_idx.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
         
-        // Assign signals: +1 for top K, -1 for bottom K, 0 for others
-        for (rank, &(_prediction, asset_idx)) in pred_with_idx.iter().enumerate() {
+        // Assign signals: +1 only for assets with predicted return > 0.5% (0.005)
+        // This ensures we only trade when expected return is more than double the trading fees
+        for (rank, &(prediction, asset_idx)) in pred_with_idx.iter().enumerate() {
             let symbol = &symbol_names[asset_idx];
-            
-            let signal = if rank < self.top_k {
-                1.0  // Go long top K assets
+
+            let signal = if rank < self.top_k && prediction > 0.002 {
+                1.0  // Go long only if predicted return > 0.5%
             } else {
-                0.0  // Stay in cash for all other assets (no short selling)
+                0.0  // Stay in cash for all other assets
             };
-            
+
             signals.insert(symbol.clone(), signal);
         }
         
@@ -260,6 +262,7 @@ fn run_model_backtest() -> Result<()> {
     println!("  - Model sequence length: {} minutes", SEQUENCE_LENGTH);
     println!("  - Long top K assets: {}", strategy.top_k);
     println!("  - Position size: {:.1}% per asset", strategy.position_size * 100.0);
+    println!("  - Minimum predicted return: >0.5% (0.005)");
     println!("  - Trading style: Long-only (no short selling)");
     println!("  - Leverage allowed: YES (can go negative cash)");
     println!("  - Rebalance frequency: Every minute");
@@ -267,19 +270,33 @@ fn run_model_backtest() -> Result<()> {
     // Run backtest
     let start_time = std::time::Instant::now();
     let mut progress_counter = 0;
-    
+    let mut last_reported_progress = 0;
+    let total_steps = test_timesteps - SEQUENCE_LENGTH;
+
     for timestamp in SEQUENCE_LENGTH..test_timesteps {
         // Step forward in time (update prices)
         backtester.step_forward(timestamp)?;
-        
+
         // Execute strategy using model predictions
         strategy.execute_step(&mut backtester, &test_data, timestamp)?;
-        
-        // Progress reporting
+
+        // Progress reporting every 10%
         progress_counter += 1;
-        if progress_counter % 1000 == 0 {
-            let progress = (timestamp as f64 / test_timesteps as f64) * 100.0;
-            println!("  Progress: {:.1}% ({}/{})", progress, timestamp, test_timesteps);
+        let current_progress = ((progress_counter as f64 / total_steps as f64) * 100.0) as u32;
+
+        if current_progress >= last_reported_progress + 10 && current_progress <= 100 {
+            let current_portfolio = backtester.get_current_portfolio();
+            let current_return = (current_portfolio.total_value - initial_capital) / initial_capital * 100.0;
+            let elapsed = start_time.elapsed().as_secs();
+
+            println!("  📊 {}% Complete - Portfolio: ${:.2} | Return: {:.2}% | Positions: {} | Time: {}s",
+                     current_progress,
+                     current_portfolio.total_value,
+                     current_return,
+                     current_portfolio.positions.len(),
+                     elapsed);
+
+            last_reported_progress = current_progress;
         }
     }
 

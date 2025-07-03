@@ -6,12 +6,16 @@ use std::path::{Path, PathBuf};
 /// Configuration for dataset transformation
 #[derive(Debug)]
 struct TransformConfig {
-    /// Minimum coverage percentage to keep a currency (e.g., 0.1 for 10%)
-    min_coverage_threshold: f64,
+    /// Minimum coverage percentage from first data point to keep a currency (e.g., 0.5 for 50%)
+    min_coverage_from_start: f64,
     /// Number of years to keep from the end of the dataset
     years_to_keep: Option<u32>,
-    /// Keep discontinued currencies if they were discontinued within this many days
-    keep_discontinued_within_days: u32,
+    /// Only keep currently traded currencies (exclude discontinued ones)
+    only_active_currencies: bool,
+    /// Percentage of currencies that should have started by the cutoff point (e.g., 0.4 for 40%)
+    currency_start_percentile: f64,
+    /// Maximum delay allowed for currency start relative to cutoff (e.g., 0.25 for 25%)
+    max_start_delay_ratio: f64,
     /// Input parquet file path
     input_path: PathBuf,
     /// Output parquet file path
@@ -21,9 +25,11 @@ struct TransformConfig {
 impl Default for TransformConfig {
     fn default() -> Self {
         Self {
-            min_coverage_threshold: 0.10, // 10% minimum coverage
-            years_to_keep: Some(4), // Keep last 4 years
-            keep_discontinued_within_days: 365, // Keep discontinued currencies from last year
+            min_coverage_from_start: 0.50, // 50% minimum coverage from first data point
+            years_to_keep: None, // Keep all time data for transformer training
+            only_active_currencies: true, // Only keep currently traded cryptos
+            currency_start_percentile: 0.40, // 40% of currencies should have started by cutoff
+            max_start_delay_ratio: 0.25, // Allow 25% delay after cutoff point
             input_path: PathBuf::from("/home/i3/Downloads/processed_dataset.parquet"),
             output_path: PathBuf::from("/home/i3/Downloads/transformed_dataset.parquet"),
         }
@@ -37,6 +43,7 @@ struct CurrencyStats {
     total_rows: usize,
     non_zero_rows: usize,
     coverage_ratio: f64,
+    coverage_from_start: f64, // Coverage from first data point onwards
     first_data_index: Option<usize>,
     last_data_index: Option<usize>,
     is_discontinued: bool,
@@ -50,6 +57,7 @@ impl CurrencyStats {
             total_rows,
             non_zero_rows: 0,
             coverage_ratio: 0.0,
+            coverage_from_start: 0.0,
             first_data_index: None,
             last_data_index: None,
             is_discontinued: false,
@@ -58,11 +66,22 @@ impl CurrencyStats {
     }
 
     fn calculate_coverage(&mut self) {
+        // Overall coverage
         self.coverage_ratio = if self.total_rows > 0 {
             self.non_zero_rows as f64 / self.total_rows as f64
         } else {
             0.0
         };
+
+        // Coverage from first data point onwards (this is what we care about)
+        if let Some(first_idx) = self.first_data_index {
+            let rows_from_start = self.total_rows.saturating_sub(first_idx);
+            if rows_from_start > 0 {
+                // Count non-zero rows from first data point onwards
+                let non_zero_from_start = self.non_zero_rows; // This is already calculated correctly
+                self.coverage_from_start = non_zero_from_start as f64 / rows_from_start as f64;
+            }
+        }
     }
 
     fn calculate_discontinuation(&mut self, total_rows: usize, minutes_per_row: u32) {
@@ -70,9 +89,13 @@ impl CurrencyStats {
             let rows_since_last = total_rows.saturating_sub(last_idx + 1);
             let minutes_since_last = rows_since_last * minutes_per_row as usize;
             self.days_since_last_data = Some((minutes_since_last / (60 * 24)) as u32);
-            
-            // Consider discontinued if no data in last 30 days (arbitrary threshold)
-            self.is_discontinued = self.days_since_last_data.unwrap_or(0) > 30;
+
+            // Consider discontinued if no data in last 7 days (more strict threshold)
+            self.is_discontinued = self.days_since_last_data.unwrap_or(0) > 7;
+        } else {
+            // If no data found at all, definitely discontinued
+            self.is_discontinued = true;
+            self.days_since_last_data = Some(u32::MAX);
         }
     }
 }
@@ -134,18 +157,30 @@ fn load_and_analyze_dataset(input_path: &Path) -> Result<(DataFrame, Vec<Currenc
             }
         }
 
-        // Find first and last data indices by iterating through the original column
+        // Find first and last data indices and count non-zero values from first data point
         if let Ok(float_series) = column.f64() {
+            let mut non_zero_from_start = 0;
+            let mut found_first = false;
+
             for (idx, opt_val) in float_series.iter().enumerate() {
                 if let Some(val) = opt_val {
                     if val != 0.0 && !val.is_nan() {
-                        if stats.first_data_index.is_none() {
+                        if !found_first {
                             stats.first_data_index = Some(idx);
+                            found_first = true;
                         }
                         stats.last_data_index = Some(idx);
+
+                        // Count non-zero values from first data point onwards
+                        if found_first {
+                            non_zero_from_start += 1;
+                        }
                     }
                 }
             }
+
+            // Update the non_zero_rows to reflect count from first data point
+            stats.non_zero_rows = non_zero_from_start;
         }
 
         stats.calculate_coverage();
@@ -154,8 +189,8 @@ fn load_and_analyze_dataset(input_path: &Path) -> Result<(DataFrame, Vec<Currenc
         currency_stats.push(stats);
     }
 
-    // Sort by coverage ratio (descending)
-    currency_stats.sort_by(|a, b| b.coverage_ratio.partial_cmp(&a.coverage_ratio).unwrap());
+    // Sort by coverage from start (descending)
+    currency_stats.sort_by(|a, b| b.coverage_from_start.partial_cmp(&a.coverage_from_start).unwrap());
 
     Ok((df, currency_stats))
 }
@@ -167,24 +202,22 @@ fn print_analysis_results(stats: &[CurrencyStats], config: &TransformConfig) {
 
     let total_currencies = stats.len();
     let above_threshold = stats.iter()
-        .filter(|s| s.coverage_ratio >= config.min_coverage_threshold)
+        .filter(|s| s.coverage_from_start >= config.min_coverage_from_start)
+        .count();
+    let active_currencies = stats.iter()
+        .filter(|s| !s.is_discontinued)
         .count();
     let discontinued = stats.iter()
         .filter(|s| s.is_discontinued)
         .count();
-    let discontinued_recent = stats.iter()
-        .filter(|s| s.is_discontinued &&
-                s.days_since_last_data.unwrap_or(u32::MAX) <= config.keep_discontinued_within_days)
-        .count();
 
     println!("Total currencies: {}", total_currencies);
-    println!("Above {}% coverage threshold: {}",
-             (config.min_coverage_threshold * 100.0) as u32, above_threshold);
+    println!("Active currencies: {}", active_currencies);
     println!("Discontinued currencies: {}", discontinued);
-    println!("Recently discontinued (within {} days): {}",
-             config.keep_discontinued_within_days, discontinued_recent);
+    println!("Above {}% coverage from start: {}",
+             (config.min_coverage_from_start * 100.0) as u32, above_threshold);
 
-    println!("\n🏆 TOP 10 CURRENCIES BY COVERAGE:");
+    println!("\n🏆 TOP 10 CURRENCIES BY COVERAGE FROM START:");
     for (i, stat) in stats.iter().take(10).enumerate() {
         let status = if stat.is_discontinued {
             format!("(DISCONTINUED - {} days ago)",
@@ -193,14 +226,21 @@ fn print_analysis_results(stats: &[CurrencyStats], config: &TransformConfig) {
             "(ACTIVE)".to_string()
         };
 
-        println!("  {}. {}: {:.1}% {}",
+        let first_data_info = if let Some(first_idx) = stat.first_data_index {
+            format!("starts at row {}", first_idx)
+        } else {
+            "no data found".to_string()
+        };
+
+        println!("  {}. {}: {:.1}% from start ({}) {}",
                  i + 1,
                  stat.name.replace("_return", ""),
-                 stat.coverage_ratio * 100.0,
+                 stat.coverage_from_start * 100.0,
+                 first_data_info,
                  status);
     }
 
-    println!("\n⚠️  BOTTOM 10 CURRENCIES BY COVERAGE:");
+    println!("\n⚠️  BOTTOM 10 CURRENCIES BY COVERAGE FROM START:");
     for (i, stat) in stats.iter().rev().take(10).enumerate() {
         let status = if stat.is_discontinued {
             format!("(DISCONTINUED - {} days ago)",
@@ -209,36 +249,42 @@ fn print_analysis_results(stats: &[CurrencyStats], config: &TransformConfig) {
             "(ACTIVE)".to_string()
         };
 
-        println!("  {}. {}: {:.1}% {}",
+        let first_data_info = if let Some(first_idx) = stat.first_data_index {
+            format!("starts at row {}", first_idx)
+        } else {
+            "no data found".to_string()
+        };
+
+        println!("  {}. {}: {:.1}% from start ({}) {}",
                  i + 1,
                  stat.name.replace("_return", ""),
-                 stat.coverage_ratio * 100.0,
+                 stat.coverage_from_start * 100.0,
+                 first_data_info,
                  status);
     }
 }
 
-/// Filter currencies based on coverage and discontinuation criteria
-fn filter_currencies(stats: &[CurrencyStats], config: &TransformConfig) -> Vec<String> {
+/// Filter currencies based on coverage from start and active trading status
+fn filter_currencies_by_coverage(stats: &[CurrencyStats], config: &TransformConfig) -> Vec<String> {
     let mut kept_currencies = Vec::new();
     let mut removed_low_coverage = 0;
-    let mut removed_old_discontinued = 0;
-    let mut kept_recent_discontinued = 0;
+    let mut removed_discontinued = 0;
+    let mut removed_no_data = 0;
 
     for stat in stats {
-        let should_keep = if stat.coverage_ratio >= config.min_coverage_threshold {
-            // Keep if above coverage threshold
+        let should_keep = if stat.first_data_index.is_none() {
+            // Remove currencies with no data at all
+            removed_no_data += 1;
+            false
+        } else if config.only_active_currencies && stat.is_discontinued {
+            // Remove discontinued currencies if we only want active ones
+            removed_discontinued += 1;
+            false
+        } else if stat.coverage_from_start >= config.min_coverage_from_start {
+            // Keep if above coverage threshold from first data point
             true
-        } else if stat.is_discontinued {
-            // For discontinued currencies, only keep if recently discontinued
-            if stat.days_since_last_data.unwrap_or(u32::MAX) <= config.keep_discontinued_within_days {
-                kept_recent_discontinued += 1;
-                true
-            } else {
-                removed_old_discontinued += 1;
-                false
-            }
         } else {
-            // Remove if below threshold and not discontinued (very sparse active currency)
+            // Remove if below coverage threshold from start
             removed_low_coverage += 1;
             false
         };
@@ -248,12 +294,24 @@ fn filter_currencies(stats: &[CurrencyStats], config: &TransformConfig) -> Vec<S
         }
     }
 
-    println!("\n🔧 FILTERING RESULTS:");
+    println!("\n🔧 COVERAGE FILTERING RESULTS:");
     println!("{}", "=".repeat(40));
     println!("Currencies kept: {}", kept_currencies.len());
-    println!("Removed (low coverage): {}", removed_low_coverage);
-    println!("Removed (old discontinued): {}", removed_old_discontinued);
-    println!("Kept (recently discontinued): {}", kept_recent_discontinued);
+    println!("Removed (no data): {}", removed_no_data);
+    println!("Removed (discontinued): {}", removed_discontinued);
+    println!("Removed (low coverage from start): {}", removed_low_coverage);
+
+    // Show some examples of kept currencies
+    println!("\n✅ SAMPLE OF KEPT CURRENCIES:");
+    for (i, currency) in kept_currencies.iter().take(10).enumerate() {
+        if let Some(stat) = stats.iter().find(|s| &s.name == currency) {
+            println!("  {}. {}: {:.1}% coverage from row {}",
+                     i + 1,
+                     currency.replace("_return", ""),
+                     stat.coverage_from_start * 100.0,
+                     stat.first_data_index.unwrap_or(0));
+        }
+    }
 
     kept_currencies
 }
@@ -299,6 +357,85 @@ fn apply_currency_filtering(df: DataFrame, currencies_to_keep: &[String]) -> Res
     Ok(filtered_df)
 }
 
+/// Calculate the row index for August 2020 (assuming 1-minute intervals)
+fn calculate_august_2020_row() -> usize {
+    // Assuming the dataset starts from some point and uses 1-minute intervals
+    // We need to calculate how many minutes from the start of the dataset to August 1, 2020
+
+    // For simplicity, let's assume the dataset starts around 2017 (when crypto trading became more common)
+    // From January 1, 2017 to August 1, 2020 is approximately:
+    // 2017: 365 days
+    // 2018: 365 days
+    // 2019: 365 days
+    // 2020: 31 (Jan) + 29 (Feb, leap year) + 31 (Mar) + 30 (Apr) + 31 (May) + 30 (Jun) + 31 (Jul) = 213 days
+    // Total: 365 + 365 + 365 + 213 = 1308 days
+
+    let days_to_august_2020 = 1308;
+    let minutes_per_day = 24 * 60;
+    let total_minutes = days_to_august_2020 * minutes_per_day;
+
+    total_minutes
+}
+
+/// Set the main starting line to August 2020
+fn set_main_starting_line_august_2020() -> usize {
+    let august_2020_row = calculate_august_2020_row();
+    println!("📅 Setting main starting line to August 2020 (estimated row: {})", august_2020_row);
+    august_2020_row
+}
+
+/// Filter currencies based on when they started relative to the main starting line
+fn filter_currencies_by_start_timing(
+    currency_stats: &[CurrencyStats],
+    main_start_line: usize,
+    tolerance_percent: f64
+) -> Vec<String> {
+    let tolerance_rows = (main_start_line as f64 * tolerance_percent) as usize;
+    let latest_acceptable_start = main_start_line + tolerance_rows;
+
+    println!("\n📍 FILTERING BY START TIMING:");
+    println!("Main starting line: row {}", main_start_line);
+    println!("Tolerance: {:.0}% ({} rows)", tolerance_percent * 100.0, tolerance_rows);
+    println!("Latest acceptable start: row {}", latest_acceptable_start);
+
+    let mut kept_currencies = Vec::new();
+    let mut removed_late_start = 0;
+    let mut removed_no_data = 0;
+
+    for stat in currency_stats {
+        if let Some(first_idx) = stat.first_data_index {
+            if first_idx <= latest_acceptable_start {
+                kept_currencies.push(stat.name.clone());
+            } else {
+                removed_late_start += 1;
+            }
+        } else {
+            removed_no_data += 1;
+        }
+    }
+
+    println!("Currencies kept: {}", kept_currencies.len());
+    println!("Removed (late start): {}", removed_late_start);
+    println!("Removed (no data): {}", removed_no_data);
+
+    kept_currencies
+}
+
+/// Trim dataset to start from the main starting line
+fn trim_dataset_from_main_line(df: DataFrame, main_start_line: usize) -> Result<DataFrame> {
+    println!("\n✂️  Trimming dataset from main starting line...");
+
+    let original_rows = df.height();
+    let trimmed_df = df.slice(main_start_line as i64, original_rows - main_start_line);
+
+    println!("Original rows: {}", original_rows);
+    println!("Trimming from row: {}", main_start_line);
+    println!("Trimmed rows: {}", trimmed_df.height());
+    println!("✅ Dataset trimming complete");
+
+    Ok(trimmed_df)
+}
+
 /// Save the transformed dataset
 fn save_transformed_dataset(df: &DataFrame, output_path: &Path) -> Result<()> {
     println!("\n💾 Saving transformed dataset to: {}", output_path.display());
@@ -327,9 +464,9 @@ fn transform_dataset(config: TransformConfig) -> Result<()> {
     println!("🚀 STARTING DATASET TRANSFORMATION");
     println!("{}", "=".repeat(60));
     println!("Configuration:");
-    println!("  Min coverage threshold: {:.1}%", config.min_coverage_threshold * 100.0);
+    println!("  Min coverage from start: {:.1}%", config.min_coverage_from_start * 100.0);
     println!("  Years to keep: {:?}", config.years_to_keep);
-    println!("  Keep discontinued within: {} days", config.keep_discontinued_within_days);
+    println!("  Only active currencies: {}", config.only_active_currencies);
     println!("  Input: {}", config.input_path.display());
     println!("  Output: {}", config.output_path.display());
 
@@ -339,25 +476,42 @@ fn transform_dataset(config: TransformConfig) -> Result<()> {
     // Step 2: Print analysis results
     print_analysis_results(&currency_stats, &config);
 
-    // Step 3: Filter currencies based on criteria
-    let currencies_to_keep = filter_currencies(&currency_stats, &config);
+    // Step 3: Set the main starting line to August 2020
+    let main_start_line = set_main_starting_line_august_2020();
 
-    // Step 4: Apply currency filtering
-    let currency_filtered_df = apply_currency_filtering(df, &currencies_to_keep)?;
+    // Step 4: Filter currencies by start timing (within 25% of main line)
+    let timing_filtered_currencies = filter_currencies_by_start_timing(&currency_stats, main_start_line, 0.25);
 
-    // Step 5: Apply time filtering (if configured)
-    let final_df = apply_time_filtering(currency_filtered_df, &config)?;
+    // Step 5: Filter by coverage among timing-filtered currencies
+    let timing_filtered_stats: Vec<CurrencyStats> = currency_stats
+        .iter()
+        .filter(|stat| timing_filtered_currencies.contains(&stat.name))
+        .cloned()
+        .collect();
 
-    // Step 6: Save the transformed dataset
+    let final_currencies_to_keep = filter_currencies_by_coverage(&timing_filtered_stats, &config);
+
+    // Step 6: Apply currency filtering
+    let currency_filtered_df = apply_currency_filtering(df, &final_currencies_to_keep)?;
+
+    // Step 7: Trim dataset from main starting line
+    let trimmed_df = trim_dataset_from_main_line(currency_filtered_df, main_start_line)?;
+
+    // Step 8: Apply time filtering (if configured)
+    let final_df = apply_time_filtering(trimmed_df, &config)?;
+
+    // Step 9: Save the transformed dataset
     save_transformed_dataset(&final_df, &config.output_path)?;
 
     println!("\n🎉 TRANSFORMATION COMPLETE!");
     println!("{}", "=".repeat(60));
     println!("Summary:");
     println!("  Original: {} currencies", currency_stats.len());
-    println!("  Filtered: {} currencies", currencies_to_keep.len());
-    println!("  Reduction: {:.1}%",
-             (1.0 - currencies_to_keep.len() as f64 / currency_stats.len() as f64) * 100.0);
+    println!("  After timing filter: {} currencies", timing_filtered_currencies.len());
+    println!("  Final kept: {} currencies", final_currencies_to_keep.len());
+    println!("  Total reduction: {:.1}%",
+             (1.0 - final_currencies_to_keep.len() as f64 / currency_stats.len() as f64) * 100.0);
+    println!("  Main starting line: row {}", main_start_line);
 
     Ok(())
 }
@@ -383,13 +537,28 @@ fn main() -> Result<()> {
                 config.years_to_keep = Some(5);
                 println!("🕐 Configured to keep last 5 years");
             }
+            "--include-discontinued" => {
+                config.only_active_currencies = false;
+                println!("📈 Configured to include discontinued currencies");
+            }
+            "--coverage-30" => {
+                config.min_coverage_from_start = 0.30;
+                println!("📊 Configured for 30% minimum coverage from start");
+            }
+            "--coverage-70" => {
+                config.min_coverage_from_start = 0.70;
+                println!("📊 Configured for 70% minimum coverage from start");
+            }
             "--help" => {
                 println!("Usage: {} [OPTIONS]", args[0]);
                 println!("Options:");
-                println!("  --keep-all-time    Keep all time data (recommended for transformers)");
-                println!("  --last-3-years     Keep only last 3 years");
-                println!("  --last-5-years     Keep only last 5 years");
-                println!("  --help             Show this help message");
+                println!("  --keep-all-time        Keep all time data (recommended for transformers)");
+                println!("  --last-3-years         Keep only last 3 years");
+                println!("  --last-5-years         Keep only last 5 years");
+                println!("  --include-discontinued Include discontinued currencies");
+                println!("  --coverage-30          Set minimum coverage to 30%");
+                println!("  --coverage-70          Set minimum coverage to 70%");
+                println!("  --help                 Show this help message");
                 return Ok(());
             }
             _ => {
