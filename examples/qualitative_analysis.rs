@@ -386,7 +386,7 @@ fn main() -> Result<()> {
 
     // Configuration
     let data_path = "/home/i3/Downloads/transformed_dataset.parquet";
-    let model_path = "current_model_ep35.safetensors";
+    let model_path = "current_model.safetensors";
 
     // Load data
     println!("\nLoading cryptocurrency data...");

@@ -189,7 +189,8 @@ fn main() -> Result<()> {
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = FinancialTransformerForMaskedRegression::load(vb, &config)?;
 
-    let checkpoint_path = format!("current_model_ep35.safetensors");
+    
+    let checkpoint_path = format!("current_model.safetensors");
     varmap.load(checkpoint_path.clone())?;
     println!("Loaded checkpoint: {}", checkpoint_path);
     
@@ -201,7 +202,7 @@ fn main() -> Result<()> {
 
 
 
-    
+    /*
     println!("Running test...");    
     let val_loss = evaluate_model(&model, &val_data, &device, "Val", mask_data_last_col)?;
     println!("Last Col Val Loss:   {:.10}", val_loss);
@@ -212,9 +213,9 @@ fn main() -> Result<()> {
     println!(" Val Loss:   {:.10}", val_loss);
     let test_loss = evaluate_model(&model, &test_data, &device, "Test", mask_data)?;
     println!(" Test Loss: {:.10}", test_loss);
-
-
+    
     return Ok(());
+    */
 
     println!("Starting training...");
     for epoch in 0..NUM_EPOCHS {
@@ -281,7 +282,7 @@ fn main() -> Result<()> {
         println!("Epoch {} Summary:", epoch + 1);
         println!("  Train Loss: {:.10}", avg_train_loss);
         println!("  Val Loss:   {:.10}", val_loss);
-
+        
         // Save model checkpoint after each epoch
         let checkpoint_path = format!("current_model.safetensors");
         varmap.save(&checkpoint_path)?;
