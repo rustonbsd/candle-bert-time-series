@@ -12,11 +12,11 @@ use candle_nn::{loss, Optimizer, VarBuilder, VarMap};
 
 // --- Configuration ---
 // NUM_TIME_SERIES will be determined dynamically from the data
-const SEQUENCE_LENGTH: usize = 120;
-const MODEL_DIMS: usize = 256;
-const NUM_LAYERS: usize = 6;
-const NUM_HEADS: usize = 8;
-const NUM_EPOCHS: usize = 50;
+const SEQUENCE_LENGTH: usize = 480;
+const MODEL_DIMS: usize = 512;
+const NUM_LAYERS: usize = 24;
+const NUM_HEADS: usize = 32;
+const NUM_EPOCHS: usize = 32;
 const LEARNING_RATE: f64 = 1e-4;
 const MASK_PROB: f32 = 0.15;
 const BATCH_SIZE: usize = 32;
@@ -189,13 +189,15 @@ fn main() -> Result<()> {
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = FinancialTransformerForMaskedRegression::load(vb, &config)?;
 
-    
-    let checkpoint_path = format!("current_model.safetensors");
+    /*
+    let checkpoint_path = format!("current_model_large.safetensors");
     varmap.load(checkpoint_path.clone())?;
     println!("Loaded checkpoint: {}", checkpoint_path);
-    
+    */
+
     let adamw_params = candle_nn::ParamsAdamW {
         lr: LEARNING_RATE,
+        weight_decay: 0.02,
         ..Default::default()
     };
     let mut optimizer = candle_nn::AdamW::new(varmap.all_vars(), adamw_params)?;
@@ -226,6 +228,7 @@ fn main() -> Result<()> {
         let mut train_batch_count = 0;
 
         let mut train_batcher = Batcher::new(&train_data, SEQUENCE_LENGTH, BATCH_SIZE);
+        let mut batch_index = 0;
 
         while let Some(batch_result) = train_batcher.next() {
             let batch = batch_result?;
@@ -256,6 +259,25 @@ fn main() -> Result<()> {
             // Now we can compare the two 1D tensors.
             let loss = loss::mse(&predicted_values, &true_labels)?;
 
+
+            /*
+            // Transformer learnign rate warmup
+            let num_batches_per_epoch = train_batcher.clone().count() as usize;
+            let total_steps = NUM_EPOCHS * num_batches_per_epoch;
+            let warmup_steps = 1000;
+            let current_step = epoch * num_batches_per_epoch + batch_index;
+            batch_index += 1;
+
+            let new_lr = if current_step < warmup_steps {
+                // Linear warmup
+                LEARNING_RATE * (current_step as f64 / warmup_steps as f64)
+            } else {
+                // Cosine decay (example)
+                LEARNING_RATE * 0.5 * (1.0 + (std::f64::consts::PI * (current_step - warmup_steps) as f64 / (total_steps - warmup_steps) as f64).cos())
+            };
+            optimizer.set_learning_rate(new_lr);
+            */
+
             // --- BACKWARD PASS ---
             optimizer.backward_step(&loss)?;
 
@@ -284,7 +306,7 @@ fn main() -> Result<()> {
         println!("  Val Loss:   {:.10}", val_loss);
         
         // Save model checkpoint after each epoch
-        let checkpoint_path = format!("current_model.safetensors");
+        let checkpoint_path = format!("current_model_large.safetensors");
         varmap.save(&checkpoint_path)?;
         println!("Saved checkpoint to: {}", checkpoint_path);
     }

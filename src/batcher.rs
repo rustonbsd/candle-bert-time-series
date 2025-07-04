@@ -1,5 +1,6 @@
 use candle_core::{Result, Tensor};
 
+#[derive(Debug, Clone)]
 pub struct Batcher<'a> {
     data: &'a Tensor,
     sequence_length: usize,

@@ -2,7 +2,7 @@ use candle_bert_time_series::dataset::load_and_prepare_data;
 use candle_bert_time_series::backtest::{extract_test_split, Backtester, TradingFees, TradeSide};
 use candle_core::{Device, Result, Tensor, DType};
 use candle_nn::{VarBuilder, VarMap};
-use rand::{Rng, SeedableRng};
+use rand::SeedableRng;
 use rand::seq::SliceRandom;
 use rand_chacha::ChaCha8Rng;
 
@@ -389,19 +389,28 @@ impl CrossSectionalAnalyzer {
     }
 }
 
-/// Optimized Alpha-based trading strategy (LONG-ONLY for Binance API compatibility)
-/// This strategy uses multiple alpha signals and improved risk management
-struct OptimizedAlphaStrategy {
+/// Ultra-Conservative Alpha Strategy (LONG-ONLY for Binance API compatibility)
+/// This strategy prioritizes capital preservation with slow but steady returns
+struct UltraConservativeStrategy {
     analyzer: CrossSectionalAnalyzer,
     divergence_threshold: f64,      // Trade when |divergence| > threshold
     base_position_size: f64,        // Base fraction of portfolio per position
-    min_return_threshold: f64,      // Minimum expected return to trade (0.5% = 0.005)
+    min_return_threshold: f64,      // Minimum expected return to trade
     max_position_size: f64,         // Maximum position size cap
     confidence_multiplier: f64,     // Multiply position size by confidence
     lookback_window: usize,         // Window for calculating signal strength
+
+    // Enhanced risk management
+    max_portfolio_exposure: f64,    // Maximum total exposure across all positions
+    stop_loss_threshold: f64,       // Stop loss threshold for individual positions
+    take_profit_threshold: f64,     // Take profit threshold
+    max_trades_per_period: usize,   // Limit trades per period to avoid overtrading
+    min_confidence_threshold: f64,  // Higher confidence requirement
+    volatility_adjustment: bool,    // Adjust position size based on volatility
+    drawdown_protection: f64,       // Reduce trading when drawdown exceeds this
 }
 
-impl OptimizedAlphaStrategy {
+impl UltraConservativeStrategy {
     fn new(
         analyzer: CrossSectionalAnalyzer,
         divergence_threshold: f64,
@@ -413,19 +422,29 @@ impl OptimizedAlphaStrategy {
             divergence_threshold,
             base_position_size,
             min_return_threshold,
-            max_position_size: 0.15,        // Cap at 15% of portfolio
-            confidence_multiplier: 2.0,     // Up to 2x position size for high confidence
-            lookback_window: 20,            // 20 periods for signal strength
+            max_position_size: 0.10,            // Cap at 10% of portfolio (conservative but tradeable)
+            confidence_multiplier: 1.8,         // Up to 1.8x position size for high confidence
+            lookback_window: 30,                // 30 periods for balanced stability vs responsiveness
+
+            // Balanced risk management parameters
+            max_portfolio_exposure: 0.35,       // Maximum 35% total exposure (allow more trading)
+            stop_loss_threshold: -0.03,         // 3% stop loss
+            take_profit_threshold: 0.02,        // 2% take profit
+            max_trades_per_period: 3,           // Maximum 3 trades per period (allow more activity)
+            min_confidence_threshold: 0.45,     // Require 45% confidence minimum (lower barrier)
+            volatility_adjustment: true,        // Enable volatility-based position sizing
+            drawdown_protection: 0.08,          // Reduce trading if drawdown > 8% (more lenient)
         }
     }
 
-    /// Calculate signal confidence based on historical divergence patterns
+    /// Calculate enhanced signal confidence with volatility and stability metrics
     fn calculate_signal_confidence(&self, data: &Tensor, timestamp: usize, crypto_idx: usize) -> Result<f64> {
         if timestamp < SEQUENCE_LENGTH + self.lookback_window {
-            return Ok(0.5); // Default confidence
+            return Ok(0.4); // Slightly higher default confidence to allow some trading
         }
 
         let mut recent_divergences = Vec::new();
+        let mut recent_returns = Vec::new();
         let start_lookback = timestamp - self.lookback_window;
 
         for t in start_lookback..timestamp {
@@ -438,6 +457,7 @@ impl OptimizedAlphaStrategy {
                             let actual = actual_vec[crypto_idx] as f64;
                             let divergence = predicted - actual;
                             recent_divergences.push(divergence);
+                            recent_returns.push(actual);
                         }
                     }
                 }
@@ -445,10 +465,10 @@ impl OptimizedAlphaStrategy {
         }
 
         if recent_divergences.is_empty() {
-            return Ok(0.5);
+            return Ok(0.4);
         }
 
-        // Calculate consistency of divergence direction
+        // Calculate current divergence
         let current_predictions = self.analyzer.get_cross_sectional_prediction(data, timestamp)?;
         let current_actual_row = data.get(timestamp - 1)?;
         let current_actual_vec: Vec<f32> = current_actual_row.to_vec1()?;
@@ -458,36 +478,95 @@ impl OptimizedAlphaStrategy {
             let current_actual = current_actual_vec[crypto_idx] as f64;
             let current_divergence = current_predicted - current_actual;
 
-            // Count how many recent divergences have the same sign as current
+            // 1. Direction consistency (more conservative)
             let same_direction_count = recent_divergences.iter()
                 .filter(|&&div| (div > 0.0 && current_divergence > 0.0) || (div < 0.0 && current_divergence < 0.0))
                 .count();
-
             let consistency = same_direction_count as f64 / recent_divergences.len() as f64;
 
-            // Calculate magnitude consistency (how stable are the divergence magnitudes)
+            // 2. Magnitude stability (penalize high volatility)
             let mean_abs_divergence = recent_divergences.iter().map(|d| d.abs()).sum::<f64>() / recent_divergences.len() as f64;
-            let current_abs_divergence = current_divergence.abs();
-            let magnitude_ratio = if mean_abs_divergence > 0.0 {
-                (current_abs_divergence / mean_abs_divergence).min(2.0) // Cap at 2x
+            let divergence_std = {
+                let variance = recent_divergences.iter()
+                    .map(|d| (d.abs() - mean_abs_divergence).powi(2))
+                    .sum::<f64>() / recent_divergences.len() as f64;
+                variance.sqrt()
+            };
+            let stability_score = if mean_abs_divergence > 0.0 {
+                (1.0 - (divergence_std / mean_abs_divergence).min(1.0)).max(0.0)
             } else {
-                1.0
+                0.5
             };
 
-            // Combine consistency and magnitude for final confidence
-            let confidence = (consistency * 0.7 + magnitude_ratio * 0.3).min(1.0);
+            // 3. Return volatility penalty (lower confidence for volatile assets)
+            let return_volatility = if recent_returns.len() > 1 {
+                let mean_return = recent_returns.iter().sum::<f64>() / recent_returns.len() as f64;
+                let variance = recent_returns.iter()
+                    .map(|r| (r - mean_return).powi(2))
+                    .sum::<f64>() / recent_returns.len() as f64;
+                variance.sqrt()
+            } else {
+                0.01 // Default low volatility
+            };
+            let volatility_penalty = (1.0 - (return_volatility * 100.0).min(1.0)).max(0.0);
+
+            // 4. Signal strength (how much above threshold)
+            let signal_strength = (current_divergence.abs() / self.divergence_threshold).min(2.0);
+            let strength_score = (signal_strength - 1.0).max(0.0) / 1.0; // 0 to 1 scale
+
+            // Combine all factors with conservative weighting
+            let confidence = (
+                consistency * 0.4 +           // Direction consistency is most important
+                stability_score * 0.3 +       // Stability of divergence patterns
+                volatility_penalty * 0.2 +    // Penalty for high volatility
+                strength_score * 0.1          // Signal strength bonus
+            ).min(1.0);
+
             Ok(confidence)
         } else {
-            Ok(0.5)
+            Ok(0.4)
         }
     }
 
-    /// Generate optimized trading signals with improved alpha logic
-    fn generate_signals(&self, data: &Tensor, timestamp: usize) -> Result<Vec<(usize, TradeSide, f64)>> {
+    /// Calculate portfolio exposure to avoid over-concentration
+    fn calculate_current_exposure(&self, backtester: &Backtester) -> f64 {
+        let current_portfolio = backtester.get_current_portfolio();
+        let total_value = current_portfolio.total_value;
+        let mut total_exposure = 0.0;
+
+        for (_, position) in &current_portfolio.positions {
+            if position.quantity > 0.0 {
+                total_exposure += position.current_value;
+            }
+        }
+
+        total_exposure / total_value
+    }
+
+    /// Check if we should reduce trading due to drawdown
+    fn should_reduce_trading(&self, backtester: &Backtester, initial_capital: f64) -> bool {
+        let current_value = backtester.portfolio_history.last().unwrap().total_value;
+        let drawdown = (initial_capital - current_value) / initial_capital;
+        drawdown > self.drawdown_protection
+    }
+
+    /// Generate ultra-conservative trading signals with extensive risk management
+    fn generate_signals(&self, data: &Tensor, timestamp: usize, backtester: &Backtester, initial_capital: f64) -> Result<Vec<(usize, TradeSide, f64)>> {
         let mut signals = Vec::new();
 
         if timestamp < SEQUENCE_LENGTH + self.lookback_window {
             return Ok(signals);
+        }
+
+        // Check if we should reduce trading due to drawdown
+        if self.should_reduce_trading(backtester, initial_capital) {
+            return Ok(signals); // No new trades during high drawdown
+        }
+
+        // Check current portfolio exposure
+        let current_exposure = self.calculate_current_exposure(backtester);
+        if current_exposure >= self.max_portfolio_exposure {
+            return Ok(signals); // No new trades if already at max exposure
         }
 
         // Get current divergence
@@ -495,7 +574,14 @@ impl OptimizedAlphaStrategy {
         let actual_returns_row = data.get(timestamp - 1)?;
         let actual_returns_vec: Vec<f32> = actual_returns_row.to_vec1()?;
 
+        let mut trade_count = 0;
+
         for (i, &crypto_idx) in self.analyzer.blacked_out_indices.iter().enumerate() {
+            // Limit trades per period
+            if trade_count >= self.max_trades_per_period {
+                break;
+            }
+
             let actual = actual_returns_vec[crypto_idx] as f64;
             let predicted = predictions[i];
             let divergence = predicted - actual;
@@ -505,29 +591,78 @@ impl OptimizedAlphaStrategy {
                 // Calculate signal confidence
                 let confidence = self.calculate_signal_confidence(data, timestamp, crypto_idx)?;
 
-                // Only trade if we have reasonable confidence
-                if confidence < 0.3 {
+                // Higher confidence threshold for conservative approach
+                if confidence < self.min_confidence_threshold {
                     continue;
                 }
 
                 if divergence < 0.0 {
                     // Model underestimated -> expect catch-up -> BUY
-                    // But only if expected return exceeds minimum threshold
-                    let expected_return = divergence.abs(); // Magnitude of underestimation
+                    let expected_return = divergence.abs();
 
+                    // Higher return threshold for conservative approach
                     if expected_return > self.min_return_threshold {
-                        // Calculate position size based on confidence and expected return
-                        let signal_strength = expected_return / self.divergence_threshold; // How much above threshold
-                        let position_multiplier = (confidence * signal_strength * self.confidence_multiplier).min(self.confidence_multiplier);
-                        let position_size = (self.base_position_size * position_multiplier).min(self.max_position_size);
+                        // Calculate conservative position size
+                        let signal_strength = (expected_return / self.divergence_threshold).min(1.5); // Cap signal strength
+                        let confidence_factor = (confidence - self.min_confidence_threshold) / (1.0 - self.min_confidence_threshold);
+                        let position_multiplier = (confidence_factor * signal_strength * self.confidence_multiplier).min(self.confidence_multiplier);
 
-                        signals.push((crypto_idx, TradeSide::Buy, position_size));
+                        // Apply volatility adjustment if enabled
+                        let volatility_factor = if self.volatility_adjustment {
+                            // Calculate recent volatility for this crypto
+                            let mut recent_returns = Vec::new();
+                            let lookback_start = timestamp.saturating_sub(20);
+                            for t in lookback_start..timestamp {
+                                if let Ok(row) = data.get(t) {
+                                    if let Ok(vec) = row.to_vec1::<f32>() {
+                                        recent_returns.push(vec[crypto_idx] as f64);
+                                    }
+                                }
+                            }
+
+                            if recent_returns.len() > 1 {
+                                let mean = recent_returns.iter().sum::<f64>() / recent_returns.len() as f64;
+                                let variance = recent_returns.iter()
+                                    .map(|r| (r - mean).powi(2))
+                                    .sum::<f64>() / recent_returns.len() as f64;
+                                let volatility = variance.sqrt();
+                                (1.0 - (volatility * 50.0).min(0.5)).max(0.5) // Reduce size for high volatility
+                            } else {
+                                1.0
+                            }
+                        } else {
+                            1.0
+                        };
+
+                        let base_size = self.base_position_size * position_multiplier * volatility_factor;
+                        let position_size = base_size.min(self.max_position_size);
+
+                        // Ensure we don't exceed max portfolio exposure
+                        let remaining_exposure = self.max_portfolio_exposure - current_exposure;
+                        let final_position_size = position_size.min(remaining_exposure);
+
+                        if final_position_size > 0.01 { // Minimum 1% position size
+                            signals.push((crypto_idx, TradeSide::Buy, final_position_size));
+                            trade_count += 1;
+                        }
                     }
                 } else {
                     // Model overestimated -> expect reversion -> SELL existing positions
-                    // Use smaller position size for sells (risk management)
-                    let position_size = (self.base_position_size * confidence).min(self.max_position_size * 0.8);
-                    signals.push((crypto_idx, TradeSide::Sell, position_size));
+                    // Only sell if we actually have a position in this crypto
+                    let symbol = format!("CRYPTO_{}", crypto_idx);
+                    let current_portfolio = backtester.get_current_portfolio();
+                    if let Some(position) = current_portfolio.positions.get(&symbol) {
+                        if position.quantity > 0.0 {
+                            // Very conservative sell sizing
+                            let confidence_factor = (confidence - self.min_confidence_threshold) / (1.0 - self.min_confidence_threshold);
+                            let position_size = (self.base_position_size * confidence_factor * 0.5).min(self.max_position_size * 0.6);
+
+                            if position_size > 0.01 {
+                                signals.push((crypto_idx, TradeSide::Sell, position_size));
+                                trade_count += 1;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -606,15 +741,16 @@ fn main() -> Result<()> {
     // Display detailed predicted vs real values for inspection
     analyzer.display_prediction_comparison(&test_data, analysis_start, analysis_end)?;
 
-    // Initialize optimized alpha-based trading strategy
-    println!("\n💰 OPTIMIZED ALPHA-BASED TRADING STRATEGY (LONG-ONLY)");
+    // Initialize balanced conservative trading strategy
+    println!("\n💰 BALANCED CONSERVATIVE TRADING STRATEGY (LONG-ONLY)");
     println!("======================================================================");
-    println!("Note: This strategy uses enhanced alpha signals and risk management");
+    println!("Note: This strategy balances capital preservation with actual trading activity");
 
-    let divergence_threshold = 0.008; // 0.8% divergence threshold (slightly lower)
-    let base_position_size = 0.06; // 6% base position size (more conservative)
-    let min_return_threshold = 0.005; // 0.5% minimum expected return (covers 2x trading fees)
-    let strategy = OptimizedAlphaStrategy::new(analyzer, divergence_threshold, base_position_size, min_return_threshold);
+    // Balanced conservative parameters - still safe but actually trades
+    let divergence_threshold = 0.006; // 0.6% divergence threshold (lower to get some signals)
+    let base_position_size = 0.04; // 4% base position size (conservative but tradeable)
+    let min_return_threshold = 0.004; // 0.4% minimum expected return (covers fees with margin)
+    let strategy = UltraConservativeStrategy::new(analyzer, divergence_threshold, base_position_size, min_return_threshold);
 
     // Create symbol names for backtesting
     let symbol_names: Vec<String> = (0..num_time_series)
@@ -630,11 +766,14 @@ fn main() -> Result<()> {
         Some(fees),
     )?;
 
-    println!("🚀 Running optimized alpha-based backtest...");
+    println!("🚀 Running balanced conservative backtest...");
     println!("  - Divergence threshold: {:.2}%", divergence_threshold * 100.0);
     println!("  - Base position size: {:.1}%", base_position_size * 100.0);
     println!("  - Max position size: {:.1}%", strategy.max_position_size * 100.0);
+    println!("  - Max portfolio exposure: {:.1}%", strategy.max_portfolio_exposure * 100.0);
+    println!("  - Min confidence threshold: {:.1}%", strategy.min_confidence_threshold * 100.0);
     println!("  - Min return threshold: {:.2}%", min_return_threshold * 100.0);
+    println!("  - Max trades per period: {}", strategy.max_trades_per_period);
     println!("  - Trading period: {} to {} ({} timesteps)",
              analysis_start, analysis_end, analysis_end - analysis_start);
 
@@ -647,7 +786,7 @@ fn main() -> Result<()> {
         backtester.step_forward(timestamp)?;
 
         // Generate trading signals based on divergence
-        if let Ok(signals) = strategy.generate_signals(&test_data, timestamp) {
+        if let Ok(signals) = strategy.generate_signals(&test_data, timestamp, &backtester, initial_capital) {
             for (crypto_idx, side, size) in signals {
                 let symbol = &symbol_names[crypto_idx];
 
@@ -729,16 +868,19 @@ fn main() -> Result<()> {
         println!("  ❌ Poor risk-adjusted returns");
     }
 
-    println!("\n💡 OPTIMIZED STRATEGY INSIGHTS (LONG-ONLY):");
+    println!("\n💡 BALANCED CONSERVATIVE STRATEGY INSIGHTS (LONG-ONLY):");
     println!("======================================================================");
-    println!("This ENHANCED ALPHA strategy uses multiple improvements over basic divergence:");
-    println!("  - CONFIDENCE SCORING: Uses 20-period lookback to assess signal reliability");
-    println!("  - DYNAMIC POSITION SIZING: 6-15% based on confidence and signal strength");
-    println!("  - MINIMUM RETURN FILTER: Only trades when expected return > 0.5% (covers fees)");
-    println!("  - RISK MANAGEMENT: Smaller sells, confidence thresholds, position caps");
-    println!("  - When model UNDERESTIMATES → BUY with confidence-weighted sizing");
-    println!("  - When model OVERESTIMATES → SELL existing positions (conservative sizing)");
-    println!("  - Limited to long positions only due to Binance API constraints");
+    println!("This BALANCED strategy combines safety with reasonable trading activity:");
+    println!("  - MODERATE CONFIDENCE: 30-period lookback + 45% minimum confidence threshold");
+    println!("  - CONSERVATIVE SIZING: 4-10% positions with 35% max portfolio exposure");
+    println!("  - REASONABLE RETURN FILTER: Only trades when expected return > 0.4% (above fees)");
+    println!("  - VOLATILITY ADJUSTMENT: Reduces position size for volatile assets");
+    println!("  - DRAWDOWN PROTECTION: Stops trading when drawdown > 8%");
+    println!("  - TRADE LIMITING: Maximum 3 trades per period for controlled activity");
+    println!("  - EXPOSURE MANAGEMENT: Never exceeds 35% total portfolio exposure");
+    println!("  - When model UNDERESTIMATES → Moderate BUY with balanced criteria");
+    println!("  - When model OVERESTIMATES → Conservative SELL of existing positions");
+    println!("  - Focus: Steady returns with controlled risk and actual trading activity");
 
     println!("\n✅ Quantitative analysis complete!");
 
