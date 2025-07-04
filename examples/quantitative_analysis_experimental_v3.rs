@@ -658,7 +658,7 @@ fn main() -> Result<()> {
 
     // Configuration
     let data_path = "/home/i3/Downloads/transformed_dataset.parquet";
-    let model_path = "current_model_large.safetensors";
+    let model_path = "current_model_large_ep3.safetensors";
     let initial_capital = 100.0;
 
     // Load data

@@ -7,7 +7,7 @@ use candle_bert_time_series::batcher::Batcher;
 use dataset::load_and_prepare_data;
 use financial_bert::{Config, FinancialTransformerForMaskedRegression};
 
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{scalar::TensorOrScalar, DType, Device, Result, Tensor};
 use candle_nn::{loss, Optimizer, VarBuilder, VarMap};
 
 // --- Configuration ---
@@ -19,7 +19,7 @@ const NUM_HEADS: usize = 12;
 const NUM_EPOCHS: usize = 32;
 const LEARNING_RATE: f64 = 1e-4;
 const MASK_PROB: f32 = 0.15;
-const BATCH_SIZE: usize = 16;
+const BATCH_SIZE: usize = 128;   // Entire dataset rn: 1594848
 
 // Data file path - update this to point to your parquet file
 const DATA_PATH: &str = "/home/i3/Downloads/transformed_dataset.parquet";
@@ -116,6 +116,7 @@ fn evaluate_model(
     masking_fn: fn(&Tensor, &Device) -> Result<(Tensor, Tensor, Tensor)>,
 ) -> Result<f32> {
     let mut total_loss = 0.0;
+    let mut total_sign_accuracy = 0.0;
     let mut batch_count = 0;
 
     let mut batcher = Batcher::new(data, SEQUENCE_LENGTH, BATCH_SIZE);
@@ -129,17 +130,26 @@ fn evaluate_model(
         // Forward pass (no gradient computation needed for evaluation)
         let predictions = model.forward(&masked_input)?;
 
-        // Calculate loss
+        // Calculate loss and sign accuracy
         let zeros = Tensor::zeros(predictions.shape(), predictions.dtype(), device)?;
         let predicted_values = mask.where_cond(&predictions, &zeros)?;
         let loss = loss::mse(&predicted_values, &true_labels)?;
 
+        // Calculate sign accuracy for directional correlation
+        let correct_signs = (predicted_values.sign()? * true_labels.sign()?)?.eq(1.0)?.sum_all()?;
+        let total_predictions = predicted_values.elem_count();
+        let sign_accuracy = correct_signs.to_scalar::<f32>()? / total_predictions as f32;
+
         total_loss += loss.to_scalar::<f32>()?;
+        total_sign_accuracy += sign_accuracy;
         batch_count += 1;
     }
 
     let avg_loss = if batch_count > 0 { total_loss / batch_count as f32 } else { 0.0 };
+    let avg_sign_accuracy = if batch_count > 0 { total_sign_accuracy / batch_count as f32 } else { 0.0 };
+
     println!("  {} Loss: {:.10} (averaged over {} batches)", dataset_name, avg_loss, batch_count);
+    println!("  {} Sign Accuracy: {:.4} ({:.1}% directional correlation)", dataset_name, avg_sign_accuracy, avg_sign_accuracy * 100.0);
 
     Ok(avg_loss)
 }
@@ -225,6 +235,7 @@ fn main() -> Result<()> {
 
         // --- TRAINING PHASE: Process all batches in the training set ---
         let mut epoch_train_loss = 0.0;
+        let mut epoch_sign_loss = 0.0;
         let mut train_batch_count = 0;
 
         let mut train_batcher = Batcher::new(&train_data, SEQUENCE_LENGTH, BATCH_SIZE);
@@ -257,8 +268,21 @@ fn main() -> Result<()> {
             let predicted_values = mask.where_cond(&predictions, &zeros)?;
 
             // Now we can compare the two 1D tensors.
-            let loss = loss::mse(&predicted_values, &true_labels)?;
+            let loss_mse = loss::mse(&predicted_values, &true_labels)?;
 
+
+            // Calculate sign accuracy and sign loss to improve directional correlation
+            let correct_signs = (predicted_values.sign()? * true_labels.sign()?)?.eq(1.0)?.to_dtype(DType::F32)?.sum_all()?;
+            let loss_sign = predicted_values.ones_like()?.sum_all()?.div(&correct_signs)?;
+
+            // Sign loss: penalize incorrect directional predictions
+            // Convert sign agreement to loss (1.0 - accuracy gives us the error rate)
+
+            // Combine MSE loss with sign loss for better directional correlation
+            // Weight the sign loss to emphasize directional accuracy
+            let sign_weight = Tensor::new(0.05f32, &device)?;
+            let mse_weight = Tensor::new(0.95f32, &device)?;
+            let loss = loss_mse.mul(&mse_weight)?.add(&loss_sign.mul(&sign_weight)?)?;
 
             /*
             // Transformer learnign rate warmup
@@ -281,20 +305,31 @@ fn main() -> Result<()> {
             // --- BACKWARD PASS ---
             optimizer.backward_step(&loss)?;
 
-            // Accumulate training loss
+            // Accumulate training loss and sign accuracy
             epoch_train_loss += loss.to_scalar::<f32>()?;
+            epoch_sign_loss += loss_sign.to_scalar::<f32>()?;
             train_batch_count += 1;
+
+            if train_batch_count % 100 == 0 {
+                println!("  Batch {}% processed", (train_batch_count as f32 / (1594848.0 / BATCH_SIZE as f32))*100.0);
+            }
         }
 
-        // Calculate average training loss for this epoch
+        // Calculate average training loss and sign accuracy for this epoch
         let avg_train_loss = if train_batch_count > 0 {
             epoch_train_loss / train_batch_count as f32
+        } else {
+            0.0
+        };
+        let avg_train_sign_accuracy = if train_batch_count > 0 {
+            epoch_sign_loss / train_batch_count as f32
         } else {
             0.0
         };
 
         println!("Training completed: {} batches processed", train_batch_count);
         println!("  Training Loss: {:.10} (averaged over {} batches)", avg_train_loss, train_batch_count);
+        println!("  Training Sign Accuracy: {:.4} ({:.1}% directional correlation)", avg_train_sign_accuracy, avg_train_sign_accuracy * 100.0);
 
         // --- VALIDATION PHASE ---
         println!("Running validation...");
