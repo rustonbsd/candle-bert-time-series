@@ -22,6 +22,7 @@ use financial_bert::{Config, FinancialTransformerForMaskedRegression};
 /// 3. Measure model divergence vs actual returns
 /// 4. Trade based on divergence signals rather than absolute predictions
 
+
 const SEQUENCE_LENGTH: usize = 240;
 const MODEL_DIMS: usize = 384;
 const NUM_LAYERS: usize = 12;
@@ -269,6 +270,8 @@ impl CrossSectionalAnalyzer {
         println!("Using {} evenly spaced samples from {} to {} (step size: {})",
                  sample_timestamps.len(), start_time, end_time, step_size);
 
+        let mut all_correlations = Vec::new();
+
         // Calculate correlation for each crypto (masking only that crypto)
         for crypto_idx in 0..num_cryptos {
             let mut predictions = Vec::new();
@@ -292,6 +295,7 @@ impl CrossSectionalAnalyzer {
             }
 
             let correlation = self.calculate_correlation(&predictions, &actuals);
+            all_correlations.push(correlation);
 
             // Calculate basic statistics
             let mean_pred = predictions.iter().sum::<f64>() / predictions.len() as f64;
@@ -320,31 +324,6 @@ impl CrossSectionalAnalyzer {
         // Summary statistics using individual masking and evenly spaced samples
         println!("\n📈 SUMMARY STATISTICS (INDIVIDUAL MASKING, EVENLY SPACED SAMPLES):");
         println!("======================================================================");
-
-        let mut all_correlations = Vec::new();
-
-        for crypto_idx in 0..num_cryptos {
-            let mut predictions = Vec::new();
-            let mut actuals = Vec::new();
-
-            // Use the same evenly spaced timestamps for consistency
-            for &timestamp in &sample_timestamps {
-                // Use individual masking for each crypto
-                if let Ok(prediction) = self.get_single_crypto_prediction(data, timestamp, crypto_idx) {
-                    if let Ok(actual_row) = data.get(timestamp) {
-                        if let Ok(actual_vec) = actual_row.to_vec1::<f32>() {
-                            predictions.push(prediction);
-                            actuals.push(actual_vec[crypto_idx] as f64);
-                        }
-                    }
-                }
-            }
-
-            if !predictions.is_empty() {
-                let correlation = self.calculate_correlation(&predictions, &actuals);
-                all_correlations.push(correlation);
-            }
-        }
 
         if !all_correlations.is_empty() {
             let mean_corr = all_correlations.iter().sum::<f64>() / all_correlations.len() as f64;
