@@ -12,14 +12,15 @@ use candle_nn::{loss, Optimizer, VarBuilder, VarMap};
 
 // --- Configuration ---
 // NUM_TIME_SERIES will be determined dynamically from the data
-const SEQUENCE_LENGTH: usize = 240;
-const MODEL_DIMS: usize = 384;
+const SEQUENCE_LENGTH: usize = 240; // 240
+const MODEL_DIMS: usize = 384; // 384
 const NUM_LAYERS: usize = 12;
 const NUM_HEADS: usize = 12;
 const NUM_EPOCHS: usize = 32;
 const LEARNING_RATE: f64 = 1e-4;
 const MASK_PROB: f32 = 0.15;
-const BATCH_SIZE: usize = 128;   // Entire dataset rn: 1594848
+const CRYPTO_MASK_PROB: f32 = 0.15; // Percentage of cryptos to mask in crypto-column masking
+const BATCH_SIZE: usize = 320;   // Entire dataset rn: 1594848
 
 // Data file path - update this to point to your parquet file
 const DATA_PATH: &str = "/home/i3/Downloads/transformed_dataset.parquet";
@@ -53,6 +54,62 @@ fn mask_data(
     let masked_input = input.broadcast_mul(&inverted_mask.to_dtype(DType::F32)?)?;
 
     Ok((masked_input, true_labels, mask))
+}
+
+
+
+/// Masks entire cryptocurrencies (15% of them) rather than random data points.
+/// This is much closer to the inference task where we predict one crypto's movements
+/// based on other cryptos' movements.
+fn mask_data_crypto_columns(
+    input: &Tensor, // Expects a 3D tensor: [BATCH_SIZE, SEQUENCE_LENGTH, NUM_TIME_SERIES] -> [32, 120, 190]
+    device: &Device,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let shape = input.shape();
+    let batch_size = shape.dims()[0];
+    let sequence_length = shape.dims()[1];
+    let num_cryptos = shape.dims()[2];
+
+    // Calculate how many cryptos to mask (15% of total)
+    let num_cryptos_to_mask = ((num_cryptos as f32) * CRYPTO_MASK_PROB).ceil() as usize;
+
+    // Create a random permutation to select which cryptos to mask
+    let mut crypto_indices: Vec<usize> = (0..num_cryptos).collect();
+
+    // Simple random shuffle using tensor operations
+    let rand_values = Tensor::rand(0f32, 1f32, &[num_cryptos], device)?;
+    let rand_vec: Vec<f32> = rand_values.to_vec1()?;
+
+    // Sort indices by random values to create a shuffle
+    crypto_indices.sort_by(|&a, &b| rand_vec[a].partial_cmp(&rand_vec[b]).unwrap());
+
+    // Take the first num_cryptos_to_mask indices as the ones to mask
+    let cryptos_to_mask = &crypto_indices[..num_cryptos_to_mask];
+
+    // Create a boolean mask for which cryptos to mask
+    // Shape: [NUM_TIME_SERIES]
+    let mut crypto_mask_vec = vec![0u8; num_cryptos];
+    for &crypto_idx in cryptos_to_mask {
+        crypto_mask_vec[crypto_idx] = 1;
+    }
+    let crypto_mask = Tensor::from_vec(crypto_mask_vec, &[num_cryptos], device)?;
+
+    // Broadcast the crypto mask to full tensor shape
+    // Shape: [1, 1, NUM_TIME_SERIES] -> [BATCH_SIZE, SEQUENCE_LENGTH, NUM_TIME_SERIES]
+    let crypto_mask_3d = crypto_mask.unsqueeze(0)?.unsqueeze(0)?;
+    let mask = crypto_mask_3d.broadcast_as(shape)?;
+
+    let zeros = Tensor::zeros(shape, input.dtype(), device)?;
+
+    // Extract true labels for masked positions
+    let true_labels = mask.where_cond(input, &zeros)?;
+
+    // Create masked input by zeroing out the masked crypto columns
+    let ones = Tensor::ones(shape, DType::U8, device)?;
+    let inverted_mask = ones.sub(&mask)?;
+    let masked_input = input.broadcast_mul(&inverted_mask.to_dtype(DType::F32)?)?;
+
+    Ok((masked_input, true_labels, mask.to_dtype(DType::U8)?))
 }
 
 fn mask_data_last_col(
@@ -116,7 +173,6 @@ fn evaluate_model(
     masking_fn: fn(&Tensor, &Device) -> Result<(Tensor, Tensor, Tensor)>,
 ) -> Result<f32> {
     let mut total_loss = 0.0;
-    let mut total_sign_accuracy = 0.0;
     let mut batch_count = 0;
 
     let mut batcher = Batcher::new(data, SEQUENCE_LENGTH, BATCH_SIZE);
@@ -135,21 +191,13 @@ fn evaluate_model(
         let predicted_values = mask.where_cond(&predictions, &zeros)?;
         let loss = loss::mse(&predicted_values, &true_labels)?;
 
-        // Calculate sign accuracy for directional correlation
-        let correct_signs = (predicted_values.sign()? * true_labels.sign()?)?.eq(1.0)?.sum_all()?;
-        let total_predictions = predicted_values.elem_count();
-        let sign_accuracy = correct_signs.to_scalar::<f32>()? / total_predictions as f32;
-
         total_loss += loss.to_scalar::<f32>()?;
-        total_sign_accuracy += sign_accuracy;
         batch_count += 1;
     }
 
     let avg_loss = if batch_count > 0 { total_loss / batch_count as f32 } else { 0.0 };
-    let avg_sign_accuracy = if batch_count > 0 { total_sign_accuracy / batch_count as f32 } else { 0.0 };
 
     println!("  {} Loss: {:.10} (averaged over {} batches)", dataset_name, avg_loss, batch_count);
-    println!("  {} Sign Accuracy: {:.4} ({:.1}% directional correlation)", dataset_name, avg_sign_accuracy, avg_sign_accuracy * 100.0);
 
     Ok(avg_loss)
 }
@@ -247,7 +295,7 @@ fn main() -> Result<()> {
             // `masked_input` Shape: [32, 120, 190]
             // `true_labels` Shape: [num_masked] (1D, flattened from all batch elements)
             // `mask` Shape: [32, 120, 190] (boolean)
-            let (masked_input, true_labels, mask) = mask_data(&batch, &device)?;
+            let (masked_input, true_labels, mask) = mask_data_crypto_columns(&batch, &device)?;
 
             // --- FORWARD PASS ---
             // The model expects a 3D tensor: (batch_size, seq_len, features).
@@ -269,20 +317,20 @@ fn main() -> Result<()> {
 
             // Now we can compare the two 1D tensors.
             let loss_mse = loss::mse(&predicted_values, &true_labels)?;
-
+            let loss = loss_mse;
 
             // Calculate sign accuracy and sign loss to improve directional correlation
-            let correct_signs = (predicted_values.sign()? * true_labels.sign()?)?.eq(1.0)?.to_dtype(DType::F32)?.sum_all()?;
-            let loss_sign = predicted_values.ones_like()?.sum_all()?.div(&correct_signs)?;
+            //let correct_signs = (predicted_values.sign()? * true_labels.sign()?)?.eq(1.0)?.to_dtype(DType::F32)?.sum_all()?;
+            //let loss_sign = predicted_values.ones_like()?.sum_all()?.div(&correct_signs)?;
 
             // Sign loss: penalize incorrect directional predictions
             // Convert sign agreement to loss (1.0 - accuracy gives us the error rate)
 
             // Combine MSE loss with sign loss for better directional correlation
             // Weight the sign loss to emphasize directional accuracy
-            let sign_weight = Tensor::new(0.05f32, &device)?;
-            let mse_weight = Tensor::new(0.95f32, &device)?;
-            let loss = loss_mse.mul(&mse_weight)?.add(&loss_sign.mul(&sign_weight)?)?;
+            //let sign_weight = Tensor::new(0.05f32, &device)?;
+            // let mse_weight = Tensor::new(0.95f32, &device)?;
+            // let loss = loss_mse.mul(&mse_weight)?.add(&loss_sign.mul(&sign_weight)?)?;
 
             /*
             // Transformer learnign rate warmup
@@ -307,7 +355,6 @@ fn main() -> Result<()> {
 
             // Accumulate training loss and sign accuracy
             epoch_train_loss += loss.to_scalar::<f32>()?;
-            epoch_sign_loss += loss_sign.to_scalar::<f32>()?;
             train_batch_count += 1;
 
             if train_batch_count % 100 == 0 {
@@ -321,16 +368,10 @@ fn main() -> Result<()> {
         } else {
             0.0
         };
-        let avg_train_sign_accuracy = if train_batch_count > 0 {
-            epoch_sign_loss / train_batch_count as f32
-        } else {
-            0.0
-        };
-
+        
         println!("Training completed: {} batches processed", train_batch_count);
         println!("  Training Loss: {:.10} (averaged over {} batches)", avg_train_loss, train_batch_count);
-        println!("  Training Sign Accuracy: {:.4} ({:.1}% directional correlation)", avg_train_sign_accuracy, avg_train_sign_accuracy * 100.0);
-
+        
         // --- VALIDATION PHASE ---
         println!("Running validation...");
         let val_loss = evaluate_model(&model, &val_data, &device, "Validation", mask_data)?;
