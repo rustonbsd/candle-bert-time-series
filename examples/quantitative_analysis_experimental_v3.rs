@@ -1,5 +1,5 @@
 use candle_bert_time_series::dataset::load_and_prepare_data;
-use candle_bert_time_series::backtest::{extract_test_split, Backtester, TradingFees, TradeSide};
+use candle_bert_time_series::backtest::extract_test_split;
 use candle_core::{Device, Result, Tensor, DType};
 use candle_nn::{VarBuilder, VarMap};
 use rand::{Rng, SeedableRng};
@@ -498,158 +498,13 @@ impl CrossSectionalAnalyzer {
     }
 }
 
-/// Optimized Alpha-based trading strategy (LONG-ONLY for Binance API compatibility)
-/// This strategy uses multiple alpha signals and improved risk management
-struct OptimizedAlphaStrategy {
-    analyzer: CrossSectionalAnalyzer,
-    divergence_threshold: f64,      // Trade when |divergence| > threshold
-    base_position_size: f64,        // Base fraction of portfolio per position
-    min_return_threshold: f64,      // Minimum expected return to trade (0.5% = 0.005)
-    max_position_size: f64,         // Maximum position size cap
-    confidence_multiplier: f64,     // Multiply position size by confidence
-    lookback_window: usize,         // Window for calculating signal strength
-}
 
-impl OptimizedAlphaStrategy {
-    fn new(
-        analyzer: CrossSectionalAnalyzer,
-        divergence_threshold: f64,
-        base_position_size: f64,
-        min_return_threshold: f64,
-    ) -> Self {
-        Self {
-            analyzer,
-            divergence_threshold,
-            base_position_size,
-            min_return_threshold,
-            max_position_size: 0.15,        // Cap at 15% of portfolio
-            confidence_multiplier: 2.0,     // Up to 2x position size for high confidence
-            lookback_window: 20,            // 20 periods for signal strength
-        }
-    }
-
-    /// Calculate signal confidence based on historical divergence patterns
-    fn calculate_signal_confidence(&self, data: &Tensor, timestamp: usize, crypto_idx: usize) -> Result<f64> {
-        if timestamp < SEQUENCE_LENGTH + self.lookback_window {
-            return Ok(0.5); // Default confidence
-        }
-
-        let mut recent_divergences = Vec::new();
-        let start_lookback = timestamp - self.lookback_window;
-
-        for t in start_lookback..timestamp {
-            if let Ok(predictions) = self.analyzer.get_cross_sectional_prediction(data, t) {
-                if let Ok(actual_row) = data.get(t) {
-                    if let Ok(actual_vec) = actual_row.to_vec1::<f32>() {
-                        // Find the index of this crypto in blacked_out_indices
-                        if let Some(crypto_position) = self.analyzer.blacked_out_indices.iter().position(|&x| x == crypto_idx) {
-                            let predicted = predictions[crypto_position];
-                            let actual = actual_vec[crypto_idx] as f64;
-                            let divergence = predicted - actual;
-                            recent_divergences.push(divergence);
-                        }
-                    }
-                }
-            }
-        }
-
-        if recent_divergences.is_empty() {
-            return Ok(0.5);
-        }
-
-        // Calculate consistency of divergence direction
-        let current_predictions = self.analyzer.get_cross_sectional_prediction(data, timestamp)?;
-        let current_actual_row = data.get(timestamp - 1)?;
-        let current_actual_vec: Vec<f32> = current_actual_row.to_vec1()?;
-
-        if let Some(crypto_position) = self.analyzer.blacked_out_indices.iter().position(|&x| x == crypto_idx) {
-            let current_predicted = current_predictions[crypto_position];
-            let current_actual = current_actual_vec[crypto_idx] as f64;
-            let current_divergence = current_predicted - current_actual;
-
-            // Count how many recent divergences have the same sign as current
-            let same_direction_count = recent_divergences.iter()
-                .filter(|&&div| (div > 0.0 && current_divergence > 0.0) || (div < 0.0 && current_divergence < 0.0))
-                .count();
-
-            let consistency = same_direction_count as f64 / recent_divergences.len() as f64;
-
-            // Calculate magnitude consistency (how stable are the divergence magnitudes)
-            let mean_abs_divergence = recent_divergences.iter().map(|d| d.abs()).sum::<f64>() / recent_divergences.len() as f64;
-            let current_abs_divergence = current_divergence.abs();
-            let magnitude_ratio = if mean_abs_divergence > 0.0 {
-                (current_abs_divergence / mean_abs_divergence).min(2.0) // Cap at 2x
-            } else {
-                1.0
-            };
-
-            // Combine consistency and magnitude for final confidence
-            let confidence = (consistency * 0.7 + magnitude_ratio * 0.3).min(1.0);
-            Ok(confidence)
-        } else {
-            Ok(0.5)
-        }
-    }
-
-    /// Generate optimized trading signals with improved alpha logic
-    fn generate_signals(&self, data: &Tensor, timestamp: usize) -> Result<Vec<(usize, TradeSide, f64)>> {
-        let mut signals = Vec::new();
-
-        if timestamp < SEQUENCE_LENGTH + self.lookback_window {
-            return Ok(signals);
-        }
-
-        // Get current divergence
-        let predictions = self.analyzer.get_cross_sectional_prediction(data, timestamp)?;
-        let actual_returns_row = data.get(timestamp - 1)?;
-        let actual_returns_vec: Vec<f32> = actual_returns_row.to_vec1()?;
-
-        for (i, &crypto_idx) in self.analyzer.blacked_out_indices.iter().enumerate() {
-            let actual = actual_returns_vec[crypto_idx] as f64;
-            let predicted = predictions[i];
-            let divergence = predicted - actual;
-
-            // Only trade if divergence exceeds threshold
-            if divergence.abs() > self.divergence_threshold {
-                // Calculate signal confidence
-                let confidence = self.calculate_signal_confidence(data, timestamp, crypto_idx)?;
-
-                // Only trade if we have reasonable confidence
-                if confidence < 0.3 {
-                    continue;
-                }
-
-                if divergence < 0.0 {
-                    // Model underestimated -> expect catch-up -> BUY
-                    // But only if expected return exceeds minimum threshold
-                    let expected_return = divergence.abs(); // Magnitude of underestimation
-
-                    if expected_return > self.min_return_threshold {
-                        // Calculate position size based on confidence and expected return
-                        let signal_strength = expected_return / self.divergence_threshold; // How much above threshold
-                        let position_multiplier = (confidence * signal_strength * self.confidence_multiplier).min(self.confidence_multiplier);
-                        let position_size = (self.base_position_size * position_multiplier).min(self.max_position_size);
-
-                        signals.push((crypto_idx, TradeSide::Buy, position_size));
-                    }
-                } else {
-                    // Model overestimated -> expect reversion -> SELL existing positions
-                    // Use smaller position size for sells (risk management)
-                    let position_size = (self.base_position_size * confidence).min(self.max_position_size * 0.8);
-                    signals.push((crypto_idx, TradeSide::Sell, position_size));
-                }
-            }
-        }
-
-        Ok(signals)
-    }
-}
 
 fn main() -> Result<()> {
     println!("📊 QUANTITATIVE ANALYSIS - Cross-Sectional Crypto Inference");
     println!("======================================================================");
     println!("This analysis focuses on inferring currency movements from others,");
-    println!("not next-step prediction. Trading based on model divergence signals.");
+    println!("not next-step prediction. Pure analysis without trading simulation.");
     println!("======================================================================");
 
     // Setup device
@@ -658,8 +513,7 @@ fn main() -> Result<()> {
 
     // Configuration
     let data_path = "/home/i3/Downloads/transformed_dataset.parquet";
-    let model_path = "current_model_large_ep3.safetensors";
-    let initial_capital = 100.0;
+    let model_path = "current_model_large_r2_ep1.safetensors";
 
     // Load data
     println!("\nLoading cryptocurrency data...");
@@ -714,140 +568,6 @@ fn main() -> Result<()> {
 
     // Display detailed predicted vs real values for inspection
     analyzer.display_prediction_comparison(&test_data, analysis_start, analysis_end)?;
-
-    // Initialize optimized alpha-based trading strategy
-    println!("\n💰 OPTIMIZED ALPHA-BASED TRADING STRATEGY (LONG-ONLY)");
-    println!("======================================================================");
-    println!("Note: This strategy uses enhanced alpha signals and risk management");
-
-    let divergence_threshold = 0.008; // 0.8% divergence threshold (slightly lower)
-    let base_position_size = 0.06; // 6% base position size (more conservative)
-    let min_return_threshold = 0.005; // 0.5% minimum expected return (covers 2x trading fees)
-    let strategy = OptimizedAlphaStrategy::new(analyzer, divergence_threshold, base_position_size, min_return_threshold);
-
-    // Create symbol names for backtesting
-    let symbol_names: Vec<String> = (0..num_time_series)
-        .map(|i| format!("CRYPTO_{}", i))
-        .collect();
-
-    // Initialize backtester
-    let fees = TradingFees::default();
-    let mut backtester = Backtester::new(
-        initial_capital,
-        test_data.clone(),
-        symbol_names.clone(),
-        Some(fees),
-    )?;
-
-    println!("🚀 Running optimized alpha-based backtest...");
-    println!("  - Divergence threshold: {:.2}%", divergence_threshold * 100.0);
-    println!("  - Base position size: {:.1}%", base_position_size * 100.0);
-    println!("  - Max position size: {:.1}%", strategy.max_position_size * 100.0);
-    println!("  - Min return threshold: {:.2}%", min_return_threshold * 100.0);
-    println!("  - Trading period: {} to {} ({} timesteps)",
-             analysis_start, analysis_end, analysis_end - analysis_start);
-
-    let mut total_trades = 0;
-    let mut successful_trades = 0;
-
-    // Run backtest
-    for timestamp in analysis_start..analysis_end {
-        // Step forward to update prices
-        backtester.step_forward(timestamp)?;
-
-        // Generate trading signals based on divergence
-        if let Ok(signals) = strategy.generate_signals(&test_data, timestamp) {
-            for (crypto_idx, side, size) in signals {
-                let symbol = &symbol_names[crypto_idx];
-
-                // Calculate position size in shares
-                let current_portfolio_value = backtester.portfolio_history.last().unwrap().total_value;
-                let position_value = current_portfolio_value * size;
-                let current_price = backtester.current_prices[crypto_idx];
-                let shares = position_value / current_price;
-
-                // Clone side for later use
-                let side_for_profit_check = side.clone();
-
-                // Execute trade
-                if let Ok(_) = backtester.execute_trade(symbol, side, shares, timestamp) {
-                    total_trades += 1;
-
-                    // Check if this trade will be profitable (simplified check)
-                    // In practice, you'd track this over multiple periods
-                    if timestamp + 5 < test_timesteps {
-                        let future_return = test_data.get(timestamp + 4)?.get(crypto_idx)?.to_scalar::<f32>()? as f64;
-                        let expected_profit = match side_for_profit_check {
-                            TradeSide::Buy => future_return > 0.0,
-                            TradeSide::Sell => {
-                                // For sells, we profit if we're exiting before a decline
-                                // or if we're taking profits from a previous good position
-                                true // Simplified: assume sells are position management
-                            },
-                        };
-                        if expected_profit {
-                            successful_trades += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Print progress every 1000 timesteps
-        if timestamp % 1000 == 0 {
-            let current_value = backtester.portfolio_history.last().unwrap().total_value;
-            let return_pct = (current_value - initial_capital) / initial_capital * 100.0;
-            println!("  Timestamp {}: Portfolio value: ${:.2} ({:+.2}%)",
-                     timestamp, current_value, return_pct);
-        }
-    }
-
-    // Calculate final performance metrics
-    let metrics = backtester.calculate_metrics()?;
-
-    println!("\n📈 BACKTEST RESULTS");
-    println!("======================================================================");
-    println!("💰 Financial Performance:");
-    println!("  - Initial capital: ${:.2}", initial_capital);
-    println!("  - Final value: ${:.2}", metrics.final_portfolio_value);
-    println!("  - Total return: {:.2}%", metrics.total_return * 100.0);
-    println!("  - Sharpe ratio: {:.3}", metrics.sharpe_ratio);
-    println!("  - Max drawdown: {:.2}%", metrics.max_drawdown * 100.0);
-
-    println!("\n📊 Trading Statistics:");
-    println!("  - Total trades: {}", total_trades);
-    println!("  - Successful trades: {} ({:.1}%)",
-             successful_trades,
-             if total_trades > 0 { successful_trades as f64 / total_trades as f64 * 100.0 } else { 0.0 });
-    println!("  - Total fees paid: ${:.2}", metrics.total_fees);
-
-    println!("\n🎯 Strategy Interpretation:");
-    if metrics.total_return > 0.05 {
-        println!("  ✅ Strong performance: Divergence signals are profitable");
-    } else if metrics.total_return > 0.0 {
-        println!("  ⚠️  Modest performance: Some signal but room for improvement");
-    } else {
-        println!("  ❌ Poor performance: Divergence signals may not be reliable");
-    }
-
-    if metrics.sharpe_ratio > 1.0 {
-        println!("  ✅ Excellent risk-adjusted returns");
-    } else if metrics.sharpe_ratio > 0.5 {
-        println!("  ⚠️  Decent risk-adjusted returns");
-    } else {
-        println!("  ❌ Poor risk-adjusted returns");
-    }
-
-    println!("\n💡 OPTIMIZED STRATEGY INSIGHTS (LONG-ONLY):");
-    println!("======================================================================");
-    println!("This ENHANCED ALPHA strategy uses multiple improvements over basic divergence:");
-    println!("  - CONFIDENCE SCORING: Uses 20-period lookback to assess signal reliability");
-    println!("  - DYNAMIC POSITION SIZING: 6-15% based on confidence and signal strength");
-    println!("  - MINIMUM RETURN FILTER: Only trades when expected return > 0.5% (covers fees)");
-    println!("  - RISK MANAGEMENT: Smaller sells, confidence thresholds, position caps");
-    println!("  - When model UNDERESTIMATES → BUY with confidence-weighted sizing");
-    println!("  - When model OVERESTIMATES → SELL existing positions (conservative sizing)");
-    println!("  - Limited to long positions only due to Binance API constraints");
 
     println!("\n✅ Quantitative analysis complete!");
 

@@ -20,7 +20,7 @@ const NUM_EPOCHS: usize = 32;
 const LEARNING_RATE: f64 = 1e-4;
 const MASK_PROB: f32 = 0.15;
 const CRYPTO_MASK_PROB: f32 = 0.15; // Percentage of cryptos to mask in crypto-column masking
-const BATCH_SIZE: usize = 320;   // Entire dataset rn: 1594848
+const BATCH_SIZE: usize = 128;   // Entire dataset rn: 1594848
 
 // Data file path - update this to point to your parquet file
 const DATA_PATH: &str = "/home/i3/Downloads/transformed_dataset.parquet";
@@ -247,11 +247,11 @@ fn main() -> Result<()> {
     let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
     let model = FinancialTransformerForMaskedRegression::load(vb, &config)?;
 
-    /*
-    let checkpoint_path = format!("current_model_large.safetensors");
+    
+    let checkpoint_path = format!("current_model_large_r2_ep1.safetensors");
     varmap.load(checkpoint_path.clone())?;
     println!("Loaded checkpoint: {}", checkpoint_path);
-    */
+    
 
     let adamw_params = candle_nn::ParamsAdamW {
         lr: LEARNING_RATE,
