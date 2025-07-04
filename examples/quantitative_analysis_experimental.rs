@@ -22,10 +22,10 @@ use financial_bert::{Config, FinancialTransformerForMaskedRegression};
 /// 3. Measure model divergence vs actual returns
 /// 4. Trade based on divergence signals rather than absolute predictions
 
-const SEQUENCE_LENGTH: usize = 120;
-const MODEL_DIMS: usize = 256;
-const NUM_LAYERS: usize = 6;
-const NUM_HEADS: usize = 8;
+const SEQUENCE_LENGTH: usize = 240;
+const MODEL_DIMS: usize = 384;
+const NUM_LAYERS: usize = 12;
+const NUM_HEADS: usize = 12;
 
 struct CrossSectionalAnalyzer {
     model: FinancialTransformerForMaskedRegression,
@@ -549,7 +549,7 @@ fn main() -> Result<()> {
 
     // Configuration
     let data_path = "/home/i3/Downloads/transformed_dataset.parquet";
-    let model_path = "current_model.safetensors";
+    let model_path = "current_model_large.safetensors";
     let initial_capital = 100.0;
 
     // Load data
