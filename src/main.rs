@@ -12,14 +12,14 @@ use candle_nn::{loss, Optimizer, VarBuilder, VarMap};
 
 // --- Configuration ---
 // NUM_TIME_SERIES will be determined dynamically from the data
-const SEQUENCE_LENGTH: usize = 480;
-const MODEL_DIMS: usize = 512;
-const NUM_LAYERS: usize = 24;
-const NUM_HEADS: usize = 32;
+const SEQUENCE_LENGTH: usize = 240;
+const MODEL_DIMS: usize = 384;
+const NUM_LAYERS: usize = 12;
+const NUM_HEADS: usize = 12;
 const NUM_EPOCHS: usize = 32;
 const LEARNING_RATE: f64 = 1e-4;
 const MASK_PROB: f32 = 0.15;
-const BATCH_SIZE: usize = 32;
+const BATCH_SIZE: usize = 16;
 
 // Data file path - update this to point to your parquet file
 const DATA_PATH: &str = "/home/i3/Downloads/transformed_dataset.parquet";
