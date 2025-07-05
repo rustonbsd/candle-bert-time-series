@@ -248,7 +248,7 @@ fn main() -> Result<()> {
     let model = FinancialTransformerForMaskedRegression::load(vb, &config)?;
 
     
-    let checkpoint_path = format!("current_model_large_r2_ep1.safetensors");
+    let checkpoint_path = format!("current_model_large_r2_ep2.safetensors");
     varmap.load(checkpoint_path.clone())?;
     println!("Loaded checkpoint: {}", checkpoint_path);
     
@@ -357,7 +357,7 @@ fn main() -> Result<()> {
             epoch_train_loss += loss.to_scalar::<f32>()?;
             train_batch_count += 1;
 
-            if train_batch_count % 100 == 0 {
+            if train_batch_count % 300 == 0 {
                 println!("  Batch {}% processed", (train_batch_count as f32 / (1594848.0 / BATCH_SIZE as f32))*100.0);
             }
         }
@@ -382,7 +382,7 @@ fn main() -> Result<()> {
         println!("  Val Loss:   {:.10}", val_loss);
         
         // Save model checkpoint after each epoch
-        let checkpoint_path = format!("current_model_large.safetensors");
+        let checkpoint_path = format!("current_model_large_r3_ep{}.safetensors", epoch + 1);
         varmap.save(&checkpoint_path)?;
         println!("Saved checkpoint to: {}", checkpoint_path);
     }

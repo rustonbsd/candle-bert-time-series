@@ -23,8 +23,8 @@ use financial_bert::{Config, FinancialTransformerForMaskedRegression};
 /// 4. Trade based on divergence signals rather than absolute predictions
 
 
-const SEQUENCE_LENGTH: usize = 240;
-const MODEL_DIMS: usize = 384;
+const SEQUENCE_LENGTH: usize = 240; // 240
+const MODEL_DIMS: usize = 384; // 384
 const NUM_LAYERS: usize = 12;
 const NUM_HEADS: usize = 12;
 
@@ -513,7 +513,7 @@ fn main() -> Result<()> {
 
     // Configuration
     let data_path = "/home/i3/Downloads/transformed_dataset.parquet";
-    let model_path = "current_model_large_r2_ep1.safetensors";
+    let model_path = "current_model_large_r3_ep2+1.safetensors";
 
     // Load data
     println!("\nLoading cryptocurrency data...");

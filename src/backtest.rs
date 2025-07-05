@@ -458,6 +458,21 @@ pub fn extract_test_split(full_data: &Tensor) -> Result<Tensor> {
     Ok(test_data)
 }
 
+/// Helper function to extract validation split data for correlation analysis
+/// Uses the same split logic as the training loop: train (70%), validation (15%), test (15%)
+pub fn extract_validation_split(full_data: &Tensor) -> Result<Tensor> {
+    let total_timesteps = full_data.dims()[0];
+
+    // Apply the SAME split logic as in main.rs training loop
+    let train_split = (total_timesteps as f32 * 0.7) as usize;
+    let val_split = (total_timesteps as f32 * 0.85) as usize;
+
+    // Return only the validation split (middle 15% of data)
+    let val_data = full_data.narrow(0, train_split, val_split - train_split)?;
+
+    Ok(val_data)
+}
+
 /// Helper function to get data split information
 pub fn get_data_split_info(total_timesteps: usize) -> (usize, usize, usize) {
     let train_split = (total_timesteps as f32 * 0.7) as usize;
