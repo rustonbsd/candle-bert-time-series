@@ -27,13 +27,13 @@ const SEQUENCE_LENGTH: usize = 240;
 const MODEL_DIMS: usize = 384;
 const NUM_LAYERS: usize = 12;
 const NUM_HEADS: usize = 12;
-const ZSCORE_WINDOW: usize = 100; // Rolling window for Z-score calculation
+const ZSCORE_WINDOW: usize = 200; // Longer rolling window for more stable Z-score calculation
 
 /// Trading position state
 #[derive(Debug, Clone)]
 enum PositionState {
     NoPosition,
-    Long { entry_price: f64, entry_zscore: f64 },
+    Long { entry_price: f64, entry_zscore: f64, entry_timestamp: usize },
 }
 
 /// Z-Score Reversion Strategy Implementation
@@ -70,13 +70,13 @@ impl ZScoreReversionStrategy {
             divergence_history: VecDeque::with_capacity(ZSCORE_WINDOW),
             position_state: PositionState::NoPosition,
             position_size,
-            long_entry_threshold: 2.0,
+            long_entry_threshold: 4.0,  // Very conservative entry
             take_profit_threshold: 0.0,
-            stop_loss_threshold: -2.0,
+            stop_loss_threshold: -4.0,  // Very conservative stop loss
         }
     }
 
-    /// Create masked input for the target cryptocurrency
+    /// Create masked input for the target cryptocurrency (first 25% real, last 75% masked)
     fn create_masked_input(&self, data: &Tensor, timestamp: usize) -> Result<Tensor> {
         if timestamp < SEQUENCE_LENGTH {
             return Err(candle_core::Error::Msg("Not enough history for sequence".to_string()));
@@ -86,34 +86,44 @@ impl ZScoreReversionStrategy {
         let input_sequence = data.narrow(0, start_idx, SEQUENCE_LENGTH)?;
         let mut masked_sequence = input_sequence.clone();
 
-        // Zero out the target cryptocurrency for the entire sequence
-        let zeros = Tensor::zeros((SEQUENCE_LENGTH, 1), DType::F32, &self.device)?;
+        // Calculate quarter point (first 25% real, last 75% masked)
+        let quarter_point = SEQUENCE_LENGTH / 4;
+
+        // Zero out the target cryptocurrency for only the last 75% of the sequence
+        let zeros = Tensor::zeros((SEQUENCE_LENGTH - quarter_point, 1), DType::F32, &self.device)?;
 
         // Get the parts of the sequence
+        let first_quarter = masked_sequence.narrow(0, 0, quarter_point)?;
+        let last_three_quarters = masked_sequence.narrow(0, quarter_point, SEQUENCE_LENGTH - quarter_point)?;
+
+        // Mask only the target crypto in the last 75%
         let before_cols = if self.target_crypto_idx > 0 {
-            Some(masked_sequence.narrow(1, 0, self.target_crypto_idx)?)
+            Some(last_three_quarters.narrow(1, 0, self.target_crypto_idx)?)
         } else {
             None
         };
-        let after_cols = if self.target_crypto_idx + 1 < masked_sequence.dims()[1] {
-            Some(masked_sequence.narrow(1, self.target_crypto_idx + 1,
-                                      masked_sequence.dims()[1] - self.target_crypto_idx - 1)?)
+        let after_cols = if self.target_crypto_idx + 1 < last_three_quarters.dims()[1] {
+            Some(last_three_quarters.narrow(1, self.target_crypto_idx + 1,
+                                          last_three_quarters.dims()[1] - self.target_crypto_idx - 1)?)
         } else {
             None
         };
 
-        // Reconstruct the sequence with zeros in the target column
-        masked_sequence = match (before_cols, after_cols) {
+        // Reconstruct the last 75% with zeros in the target column
+        let masked_last_part = match (before_cols, after_cols) {
             (Some(before), Some(after)) => Tensor::cat(&[&before, &zeros, &after], 1)?,
             (Some(before), None) => Tensor::cat(&[&before, &zeros], 1)?,
             (None, Some(after)) => Tensor::cat(&[&zeros, &after], 1)?,
             (None, None) => zeros,
         };
 
+        // Combine first quarter (real) with masked last 75%
+        masked_sequence = Tensor::cat(&[&first_quarter, &masked_last_part], 0)?;
+
         Ok(masked_sequence)
     }
 
-    /// Get prediction for the target crypto
+    /// Get prediction for the target crypto (average of last 75% predictions)
     fn get_prediction(&self, data: &Tensor, timestamp: usize) -> Result<f64> {
         let masked_input = self.create_masked_input(data, timestamp)?;
         let input_batch = masked_input.unsqueeze(0)?; // Add batch dimension
@@ -121,11 +131,19 @@ impl ZScoreReversionStrategy {
         // Get model predictions
         let predictions = self.model.forward(&input_batch)?;
 
-        // Extract prediction for the last timestep of the target crypto
-        let last_timestep_predictions = predictions.get(0)?.get(SEQUENCE_LENGTH - 1)?;
-        let predictions_vec: Vec<f32> = last_timestep_predictions.to_vec1()?;
+        // Extract predictions for the last 75% of the sequence for the target crypto
+        let quarter_point = SEQUENCE_LENGTH / 4;
+        let mut crypto_predictions = Vec::new();
 
-        Ok(predictions_vec[self.target_crypto_idx] as f64)
+        for t in quarter_point..SEQUENCE_LENGTH {
+            let timestep_predictions = predictions.get(0)?.get(t)?;
+            let predictions_vec: Vec<f32> = timestep_predictions.to_vec1()?;
+            crypto_predictions.push(predictions_vec[self.target_crypto_idx] as f64);
+        }
+
+        // Return the average prediction for the masked portion
+        let avg_prediction = crypto_predictions.iter().sum::<f64>() / crypto_predictions.len() as f64;
+        Ok(avg_prediction)
     }
 
     /// Calculate correlation between predictions and actuals for the target crypto
@@ -196,8 +214,8 @@ impl ZScoreReversionStrategy {
             self.divergence_history.pop_front();
         }
 
-        // Need at least 30 samples to calculate meaningful Z-score
-        if self.divergence_history.len() < 30 {
+        // Need at least 100 samples to calculate meaningful Z-score
+        if self.divergence_history.len() < 100 {
             return 0.0;
         }
 
@@ -265,7 +283,7 @@ impl ZScoreReversionStrategy {
         let zscore = self.update_and_calculate_zscore(divergence);
 
         // Skip if Z-score calculation is not ready
-        if self.divergence_history.len() < 30 {
+        if self.divergence_history.len() < 100 {
             return Ok(None);
         }
 
@@ -276,13 +294,20 @@ impl ZScoreReversionStrategy {
                     self.position_state = PositionState::Long {
                         entry_price: current_price,
                         entry_zscore: zscore,
+                        entry_timestamp: timestamp,
                     };
                     return Ok(Some((TradeSide::Buy, self.position_size)));
                 }
             },
-            PositionState::Long { entry_price: _, entry_zscore: _ } => {
-                // Check for take profit (Z-score returns to 0)
-                if (zscore - self.take_profit_threshold).abs() < 0.5 {
+            PositionState::Long { entry_price: _, entry_zscore: _, entry_timestamp } => {
+                // Minimum holding period of 20 timesteps to allow more price movement
+                let min_holding_period = 20;
+                if timestamp - entry_timestamp < min_holding_period {
+                    return Ok(None);
+                }
+
+                // Check for take profit (Z-score returns closer to 0, but with tighter band for better profits)
+                if zscore < 0.5 && zscore > -0.5 {
                     self.position_state = PositionState::NoPosition;
                     return Ok(Some((TradeSide::Sell, 1.0))); // Sell entire position
                 }
@@ -312,6 +337,7 @@ fn main() -> Result<()> {
     println!("   - Stop Loss: Z-score < -2.0 (signal failed, cut losses)");
     println!("   - Negative Correlation: Invert all rules");
     println!("5. No short positions allowed");
+    println!("6. Conservative parameters to reduce over-trading");
     println!("======================================================================");
 
     // Setup device
@@ -320,10 +346,10 @@ fn main() -> Result<()> {
 
     // Configuration
     let data_path = "/home/i3/Downloads/transformed_dataset.parquet";
-    let model_path = "current_model_large_r2_ep1.safetensors";
+    let model_path = "current_model_large_r3_ep2+1.safetensors";
     let initial_capital = 100.0;
-    let target_crypto_idx = 5; // Specify which crypto to trade (change this as needed)
-    let position_size = 0.1; // 10% position size
+    let target_crypto_idx = 58; // Specify which crypto to trade (change this as needed)
+    let position_size = 0.5; // 50% position size (much larger positions, much fewer trades)
 
     // Load data
     println!("\nLoading cryptocurrency data...");
@@ -428,32 +454,33 @@ fn main() -> Result<()> {
         // Generate trading signal for target crypto
         if let Ok(Some((side, size))) = strategy.generate_signal(&test_data, timestamp, current_price) {
             // Calculate position size in shares
-            let position_value = match side {
-                TradeSide::Buy => current_portfolio_value * size,
+            let shares = match side {
+                TradeSide::Buy => {
+                    let position_value = current_portfolio_value * size;
+                    let calculated_shares = position_value / current_price;
+                    // Ensure minimum trade size of 0.01 shares
+                    calculated_shares.max(0.01)
+                },
                 TradeSide::Sell => {
                     // For sell, size represents the fraction of position to sell
                     let current_portfolio = backtester.get_current_portfolio();
                     if let Some(position) = current_portfolio.positions.get(&target_symbol) {
-                        position.quantity * size
+                        let shares_to_sell = position.quantity * size;
+                        shares_to_sell.max(0.01) // Minimum sell size
                     } else {
                         0.0
                     }
                 }
             };
 
-            let shares = match side {
-                TradeSide::Buy => position_value / current_price,
-                TradeSide::Sell => position_value,
-            };
-
             // Execute trade
-            if shares > 0.0 {
+            if shares >= 0.01 {
                 if let Ok(_) = backtester.execute_trade(&target_symbol, side.clone(), shares, timestamp) {
                     total_trades += 1;
 
                     // Get current divergence and Z-score for display
                     let divergence = strategy.calculate_divergence(&test_data, timestamp).unwrap_or(0.0);
-                    let zscore = if strategy.divergence_history.len() >= 30 {
+                    let zscore = if strategy.divergence_history.len() >= 100 {
                         let mean: f64 = strategy.divergence_history.iter().sum::<f64>() / strategy.divergence_history.len() as f64;
                         let variance: f64 = strategy.divergence_history.iter()
                             .map(|x| (x - mean).powi(2))
@@ -462,10 +489,10 @@ fn main() -> Result<()> {
                         if std_dev > 0.0 { (divergence - mean) / std_dev } else { 0.0 }
                     } else { 0.0 };
 
-                    println!("  T{}: {} {} shares of {} (${:.4}/share, Div: {:.4}, Z: {:.2})",
+                    println!("  T{}: {} {:.3} shares of {} (${:.4}/share, Div: {:.4}, Z: {:.2})",
                              timestamp,
                              match side { TradeSide::Buy => "BUY", TradeSide::Sell => "SELL" },
-                             shares.round() as i32,
+                             shares,
                              target_symbol,
                              current_price,
                              divergence,
@@ -485,7 +512,7 @@ fn main() -> Result<()> {
             let value_change = current_portfolio_value - last_portfolio_value;
             let current_portfolio = backtester.get_current_portfolio();
             let position_info = if let Some(position) = current_portfolio.positions.get(&target_symbol) {
-                format!("{:.1} shares (${:.2})", position.quantity, position.current_value)
+                format!("{:.3} shares (${:.2})", position.quantity, position.current_value)
             } else {
                 "No position".to_string()
             };
@@ -497,12 +524,13 @@ fn main() -> Result<()> {
             // Show position state
             match &strategy.position_state {
                 PositionState::NoPosition => println!("    Position State: No Position"),
-                PositionState::Long { entry_price, entry_zscore } => {
+                PositionState::Long { entry_price, entry_zscore, entry_timestamp } => {
                     let unrealized_pnl = if let Some(position) = current_portfolio.positions.get(&target_symbol) {
                         (current_price - entry_price) * position.quantity
                     } else { 0.0 };
-                    println!("    Position State: Long (Entry: ${:.4}, Z: {:.2}, PnL: ${:.2})",
-                             entry_price, entry_zscore, unrealized_pnl);
+                    let holding_period = timestamp - entry_timestamp;
+                    println!("    Position State: Long (Entry: ${:.4}, Z: {:.2}, PnL: ${:.2}, Hold: {})",
+                             entry_price, entry_zscore, unrealized_pnl, holding_period);
                 }
             }
 
@@ -538,7 +566,7 @@ fn main() -> Result<()> {
     // Show final position state
     match &strategy.position_state {
         PositionState::NoPosition => println!("  - Final position: No Position"),
-        PositionState::Long { entry_price, entry_zscore } => {
+        PositionState::Long { entry_price, entry_zscore, entry_timestamp: _ } => {
             println!("  - Final position: Long (Entry: ${:.4}, Entry Z-score: {:.2})",
                      entry_price, entry_zscore);
         }
