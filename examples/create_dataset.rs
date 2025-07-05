@@ -5,7 +5,7 @@ use polars::prelude::*;
 use std::fs;
 use std::path::Path;
 
-/// Processes raw 1-minute k-line data into a model-ready dataset of returns.
+/// Processes raw 15-minute k-line data into a model-ready dataset of returns.
 /// Uses a more efficient approach that processes symbols in batches to avoid memory issues.
 ///
 /// # Arguments
@@ -371,8 +371,8 @@ fn load_existing_batches(output_dir: &Path) -> Result<Vec<DataFrame>> {
 
 fn main() -> Result<()> {
     // Configuration
-    let raw_data_dir = Path::new("/mnt/storage-box/crypto_data_k_lines/1m");
-    let output_path = Path::new("/mnt/storage-box/crypto_data_k_lines/1m/processed_dataset.parquet");
+    let raw_data_dir = Path::new("/mnt/storage-box/15m");
+    let output_path = Path::new("/mnt/storage-box/15m/processed_dataset.parquet");
     let pairlist_file = "pairlist.txt";
     let batch_size = 10; // Process 10 symbols at a time to avoid memory issues
     let use_existing_batches = true; // Set to true to use existing batch files

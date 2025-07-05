@@ -11,7 +11,7 @@ use walkdir;
 const DAILY_BASE_URL: &str = "https://data.binance.vision/data/spot/daily/klines";
 const MONTHLY_BASE_URL: &str = "https://data.binance.vision/data/spot/monthly/klines";
 const BATCH_SIZE: usize = 30; // Save data every 30 days to avoid losing progress
-const KLINE_INTERVAL: &str = "1m"; // 1 minute intervals
+const KLINE_INTERVAL: &str = "15m"; // 15 minute intervals
 
 /// Check what data already exists by scanning the partitioned directory structure
 fn get_latest_date_from_partitioned_data(data_dir: &Path) -> Result<Option<NaiveDate>> {
@@ -701,7 +701,7 @@ fn main() -> Result<()> {
     println!("Using {} CPU cores for parallel processing", num_cores);
 
     // --- Configuration ---
-    let output_dir = PathBuf::from("/mnt/storage-box/crypto_data_k_lines/1m");
+    let output_dir = PathBuf::from("/mnt/storage-box/15m");
     let pairlist_file = "pairlist.txt";
     const CONCURRENT_JOBS: usize = 13; // Process 5 pairs concurrently
 

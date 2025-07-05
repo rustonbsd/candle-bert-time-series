@@ -30,8 +30,8 @@ impl Default for TransformConfig {
             only_active_currencies: true, // Only keep currently traded cryptos
             currency_start_percentile: 0.40, // 40% of currencies should have started by cutoff
             max_start_delay_ratio: 0.25, // Allow 25% delay after cutoff point
-            input_path: PathBuf::from("/home/i3/Downloads/processed_dataset.parquet"),
-            output_path: PathBuf::from("/home/i3/Downloads/transformed_dataset.parquet"),
+            input_path: PathBuf::from("/mnt/storage-box/15m/processed_dataset.parquet"),
+            output_path: PathBuf::from("/mnt/storage-box/15m/transformed_dataset.parquet"),
         }
     }
 }
@@ -184,7 +184,7 @@ fn load_and_analyze_dataset(input_path: &Path) -> Result<(DataFrame, Vec<Currenc
         }
 
         stats.calculate_coverage();
-        stats.calculate_discontinuation(total_rows, 1); // Assuming 1-minute intervals
+        stats.calculate_discontinuation(total_rows, 15); // Assuming 15-minute intervals
         
         currency_stats.push(stats);
     }
@@ -323,7 +323,8 @@ fn apply_time_filtering(df: DataFrame, config: &TransformConfig) -> Result<DataF
 
         let total_rows = df.height();
         let minutes_per_year = 365 * 24 * 60; // Approximate minutes in a year
-        let rows_to_keep = (years_to_keep as usize * minutes_per_year).min(total_rows);
+        let intervals_per_year = minutes_per_year / 15; // Convert to 15-minute intervals
+        let rows_to_keep = (years_to_keep as usize * intervals_per_year).min(total_rows);
         let start_row = total_rows.saturating_sub(rows_to_keep);
 
         println!("Original rows: {}", total_rows);
@@ -357,10 +358,10 @@ fn apply_currency_filtering(df: DataFrame, currencies_to_keep: &[String]) -> Res
     Ok(filtered_df)
 }
 
-/// Calculate the row index for August 2020 (assuming 1-minute intervals)
+/// Calculate the row index for August 2020 (assuming 15-minute intervals)
 fn calculate_august_2020_row() -> usize {
-    // Assuming the dataset starts from some point and uses 1-minute intervals
-    // We need to calculate how many minutes from the start of the dataset to August 1, 2020
+    // Assuming the dataset starts from some point and uses 15-minute intervals
+    // We need to calculate how many 15-minute intervals from the start of the dataset to August 1, 2020
 
     // For simplicity, let's assume the dataset starts around 2017 (when crypto trading became more common)
     // From January 1, 2017 to August 1, 2020 is approximately:
@@ -373,8 +374,9 @@ fn calculate_august_2020_row() -> usize {
     let days_to_august_2020 = 1308;
     let minutes_per_day = 24 * 60;
     let total_minutes = days_to_august_2020 * minutes_per_day;
+    let total_intervals = total_minutes / 15; // Convert to 15-minute intervals
 
-    total_minutes
+    total_intervals
 }
 
 /// Set the main starting line to August 2020
