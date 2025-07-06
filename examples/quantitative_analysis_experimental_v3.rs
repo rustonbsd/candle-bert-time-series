@@ -24,9 +24,9 @@ use financial_bert::{Config, FinancialTransformerForMaskedRegression};
 
 
 const SEQUENCE_LENGTH: usize = 240; // 240
-const MODEL_DIMS: usize = 384; // 384
-const NUM_LAYERS: usize = 12;
-const NUM_HEADS: usize = 12;
+const MODEL_DIMS: usize = 128; // 384
+const NUM_LAYERS: usize = 4;
+const NUM_HEADS: usize = 4;
 
 struct CrossSectionalAnalyzer {
     model: FinancialTransformerForMaskedRegression,
@@ -512,8 +512,8 @@ fn main() -> Result<()> {
     println!("Using device: {:?}", device);
 
     // Configuration
-    let data_path = "/home/i3/Downloads/transformed_dataset.parquet";
-    let model_path = "current_model_large_r3_ep2+1.safetensors";
+    let data_path = "/mnt/storage-box/15m/transformed_dataset.parquet";
+    let model_path = "training_saves_15m/current_model_tiny_r1_ep176.safetensors";
 
     // Load data
     println!("\nLoading cryptocurrency data...");

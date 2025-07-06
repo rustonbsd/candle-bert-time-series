@@ -9,10 +9,10 @@ use std::collections::VecDeque;
 mod financial_bert;
 use financial_bert::{Config, FinancialTransformerForMaskedRegression, PositionEmbeddingType};
 
-const SEQUENCE_LENGTH: usize = 240;
-const MODEL_DIMS: usize = 384;
-const NUM_LAYERS: usize = 12;
-const NUM_HEADS: usize = 12;
+const SEQUENCE_LENGTH: usize = 240; // 240
+const MODEL_DIMS: usize = 128; // 384
+const NUM_LAYERS: usize = 4;
+const NUM_HEADS: usize = 4;
 const ZSCORE_WINDOW: usize = 1000;
 
 /// Enhanced divergence calculation methods
@@ -85,13 +85,13 @@ impl EnhancedDivergenceStrategy {
             divergence_method,
             
             // Conservative thresholds
-            long_entry_threshold: 2.0,     // Higher threshold for entry
-            take_profit_threshold: -1.5,   // Exit when Z-score returns to -1
+            long_entry_threshold: 4.0,     // Higher threshold for entry
+            take_profit_threshold: -1.0,   // Exit when Z-score returns to -1
             stop_loss_threshold: -4.0,     // Stop loss threshold
-            price_stop_loss_pct: 0.05,     // 2% price-based stop loss
+            price_stop_loss_pct: 0.02,     // 2% price-based stop loss
             partial_profit_pct: 0.2,       // Take 50% profit at Z=0
             trailing_stop_pct: 0.01,       // 1% trailing stop
-            min_holding_period: 10,        // Minimum 20 timesteps
+            min_holding_period: 1,        // Minimum 20 timesteps
         }
     }
 
@@ -699,10 +699,10 @@ fn main() -> Result<()> {
     println!("Using device: {:?}", device);
 
     // Configuration
-    let data_path = "/home/i3/Downloads/transformed_dataset.parquet";
-    let model_path = "current_model_large_r3_ep2+1.safetensors";
+    let data_path = "/mnt/storage-box/15m/transformed_dataset.parquet";
+    let model_path = "training_saves_15m/current_model_tiny_r1_ep176.safetensors";
     let initial_capital = 100.0;
-    let target_crypto_idx = 87; // CRYPTO_58 from previous successful tests
+    let target_crypto_idx = 66; // CRYPTO_58 from previous successful tests
     let position_size = 0.5; // 50% position size
 
     // Load and prepare data
