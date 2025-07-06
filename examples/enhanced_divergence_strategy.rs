@@ -700,9 +700,9 @@ fn main() -> Result<()> {
 
     // Configuration
     let data_path = "/mnt/storage-box/15m/transformed_dataset.parquet";
-    let model_path = "training_saves_15m/current_model_tiny_r1_ep176.safetensors";
+    let model_path = "training_saves_15m/current_model_tiny_r4_ep320.safetensors";
     let initial_capital = 100.0;
-    let target_crypto_idx = 66; // CRYPTO_58 from previous successful tests
+    let target_crypto_idx = 16; // CRYPTO_58 from previous successful tests
     let position_size = 0.5; // 50% position size
 
     // Load and prepare data

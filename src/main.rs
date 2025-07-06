@@ -17,7 +17,7 @@ const MODEL_DIMS: usize = 128; // 384
 const NUM_LAYERS: usize = 4;
 const NUM_HEADS: usize = 4;
 const NUM_EPOCHS: usize = 500;
-const LEARNING_RATE: f64 = 5e-5;
+const LEARNING_RATE: f64 = 1e-5;
 const MASK_PROB: f32 = 0.15;
 const CRYPTO_MASK_PROB: f32 = 0.15; // Percentage of cryptos to mask in crypto-column masking
 const BATCH_SIZE: usize = 512;   // Entire dataset rn: 1594848
@@ -249,7 +249,7 @@ fn main() -> Result<()> {
 
     
     
-    let checkpoint_path = format!("training_saves_15m/current_model_tiny_r1_ep176.safetensors");
+    let checkpoint_path = format!("training_saves_15m/current_model_tiny_r3_ep201.safetensors");
     varmap.load(checkpoint_path.clone())?;
     println!("Loaded checkpoint: {}", checkpoint_path);
     
@@ -282,7 +282,7 @@ fn main() -> Result<()> {
     let total_bach_count = train_data.dims()[0] / BATCH_SIZE;
 
     println!("Starting training...");
-    for epoch in 176..NUM_EPOCHS {
+    for epoch in 202..NUM_EPOCHS {
         println!("\n--- Epoch {} ---", epoch + 1);
 
         // --- TRAINING PHASE: Process all batches in the training set ---
@@ -375,7 +375,7 @@ fn main() -> Result<()> {
         
         // Save model checkpoint after each epoch
         println!("Trying to save checkpoint...");
-        let checkpoint_path = format!("training_saves_15m/current_model_tiny_r2_ep{}.safetensors", epoch);
+        let checkpoint_path = format!("training_saves_15m/current_model_tiny_r4_ep{}.safetensors", epoch);
         varmap.save(&checkpoint_path)?;
         println!("Saved checkpoint to: {}", checkpoint_path);
 

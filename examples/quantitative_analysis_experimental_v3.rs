@@ -326,9 +326,19 @@ impl CrossSectionalAnalyzer {
         println!("======================================================================");
 
         if !all_correlations.is_empty() {
-            let mean_corr = all_correlations.iter().sum::<f64>() / all_correlations.len() as f64;
+            let abs_mean_corr = all_correlations.iter().map(|c| c.abs()).sum::<f64>() / all_correlations.len() as f64;
             let max_corr = all_correlations.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
             let min_corr = all_correlations.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+
+            // Calculate median correlation
+            let mut sorted_abs_correlations: Vec<f64> = all_correlations.iter().map(|c| c.abs()).collect();
+            sorted_abs_correlations.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median_corr = if sorted_abs_correlations.len() % 2 == 0 {
+                let mid = sorted_abs_correlations.len() / 2;
+                (sorted_abs_correlations[mid - 1] + sorted_abs_correlations[mid]) / 2.0
+            } else {
+                sorted_abs_correlations[sorted_abs_correlations.len() / 2]
+            };
 
             // Count strong correlations
             let strong_correlations = all_correlations.iter().filter(|&&c| c.abs() > 0.1).count();
@@ -336,7 +346,8 @@ impl CrossSectionalAnalyzer {
             let no_signal = all_correlations.len() - strong_correlations - weak_correlations;
 
             println!("🌍 ALL CRYPTOS ({} total) - INDIVIDUAL MASKING RESULTS:", all_correlations.len());
-            println!("  - Mean correlation: {:.4}", mean_corr);
+            println!("  - Abs correlation avg: {:.4}", abs_mean_corr);
+            println!("  - Median correlation: {:.4}", median_corr);
             println!("  - Max correlation: {:.4}", max_corr);
             println!("  - Min correlation: {:.4}", min_corr);
             println!("  - Strong signals (|corr| > 0.1): {} ({:.1}%)",
@@ -513,7 +524,7 @@ fn main() -> Result<()> {
 
     // Configuration
     let data_path = "/mnt/storage-box/15m/transformed_dataset.parquet";
-    let model_path = "training_saves_15m/current_model_tiny_r1_ep176.safetensors";
+    let model_path = "training_saves_15m/current_model_tiny_r4_ep403.safetensors";
 
     // Load data
     println!("\nLoading cryptocurrency data...");
@@ -565,11 +576,6 @@ fn main() -> Result<()> {
     let analysis_end = test_timesteps - 1;
 
     analyzer.analyze_inference_quality(&test_data, analysis_start, analysis_end)?;
-
-    // Display detailed predicted vs real values for inspection
-    analyzer.display_prediction_comparison(&test_data, analysis_start, analysis_end)?;
-
-    println!("\n✅ Quantitative analysis complete!");
 
     Ok(())
 }
