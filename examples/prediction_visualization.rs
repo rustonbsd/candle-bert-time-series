@@ -4,16 +4,17 @@ use candle_core::{Device, Result, Tensor, DType};
 use candle_nn::{VarBuilder, VarMap};
 // Removed unused rand imports
 use plotters::prelude::*;
+use plotters::element::Circle;
 
 // Include the financial_bert module
 #[path = "../src/financial_bert.rs"]
 mod financial_bert;
 use financial_bert::{Config, FinancialTransformerForMaskedRegression};
 
-const SEQUENCE_LENGTH: usize = 240;
-const MODEL_DIMS: usize = 128;
-const NUM_LAYERS: usize = 4;
-const NUM_HEADS: usize = 4;
+const SEQUENCE_LENGTH: usize = 240; // 240
+const MODEL_DIMS: usize = 128; // 384
+const NUM_LAYERS: usize = 8;
+const NUM_HEADS: usize = 8;
 
 struct PredictionVisualizer {
     model: FinancialTransformerForMaskedRegression,
@@ -197,61 +198,182 @@ impl PredictionVisualizer {
         Ok((all_predictions, all_real_values, all_timestamps))
     }
 
-    /// Create visualization plot
+    /// Create visualization plot with two subplots: predictions vs real, and difference
     fn create_plot(&self, predictions: &[f64], real_values: &[f64], timestamps: &[usize]) -> Result<()> {
         let output_path = format!("prediction_vs_real_crypto_{}.png", self.selected_crypto_idx);
-        
-        println!("🎨 Creating visualization plot...");
-        
-        // Create the drawing area
-        let root = BitMapBackend::new(&output_path, (2500, 1200)).into_drawing_area();
+
+        println!("🎨 Creating dual-panel visualization plot...");
+
+        // Create the drawing area with larger height for two subplots
+        let root = BitMapBackend::new(&output_path, (2600, 2600)).into_drawing_area();
         root.fill(&WHITE).map_err(|e| candle_core::Error::Msg(format!("Plot error: {}", e)))?;
-        
-        // Find data ranges
+
+        // Split into three subplots (vertically)
+        let areas = root.split_evenly((3, 1));
+        let upper = &areas[0];
+        let middle = &areas[1];
+        let lower = &areas[2];
+
+        // Calculate difference values
+        let differences: Vec<f64> = predictions.iter().zip(real_values.iter())
+            .map(|(p, r)| p - r)
+            .collect();
+
+        // Calculate rolling correlation (window size of 500 points)
+        let window_size = 500;
+        let mut rolling_correlations = Vec::new();
+        let mut rolling_timestamps = Vec::new();
+
+        for i in window_size..predictions.len() {
+            let window_pred = &predictions[i-window_size..i];
+            let window_real = &real_values[i-window_size..i];
+            let corr = self.calculate_correlation(window_pred, window_real);
+            rolling_correlations.push(corr);
+            rolling_timestamps.push(timestamps[i]);
+        }
+
+        let min_time = *timestamps.first().unwrap_or(&0) as f64;
+        let max_time = *timestamps.last().unwrap_or(&1) as f64;
+
+        // === UPPER PLOT: Scatter Plot (Predicted vs Real) ===
         let min_val = predictions.iter().chain(real_values.iter()).fold(f64::INFINITY, |a, &b| a.min(b));
         let max_val = predictions.iter().chain(real_values.iter()).fold(f64::NEG_INFINITY, |a, &b| a.max(b));
         let val_range = max_val - min_val;
         let val_margin = val_range * 0.1;
-        
-        let min_time = *timestamps.first().unwrap_or(&0) as f64;
-        let max_time = *timestamps.last().unwrap_or(&1) as f64;
-        
-        // Create chart
-        let mut chart = ChartBuilder::on(&root)
-            .caption(&format!("Predicted vs Real Values - CRYPTO_{}", self.selected_crypto_idx), ("sans-serif", 40))
+
+        let mut upper_chart = ChartBuilder::on(upper)
+            .caption(&format!("Predicted vs Real Values (Scatter) - CRYPTO_{}", self.selected_crypto_idx), ("sans-serif", 35))
+            .margin(10)
+            .x_label_area_size(60)
+            .y_label_area_size(80)
+            .build_cartesian_2d(
+                (min_val - val_margin)..(max_val + val_margin),
+                (min_val - val_margin)..(max_val + val_margin)
+            ).map_err(|e| candle_core::Error::Msg(format!("Upper chart creation error: {}", e)))?;
+
+        upper_chart
+            .configure_mesh()
+            .x_desc("Real Values")
+            .y_desc("Predicted Values")
+            .draw().map_err(|e| candle_core::Error::Msg(format!("Upper mesh draw error: {}", e)))?;
+
+        // Draw perfect prediction line (diagonal)
+        upper_chart
+            .draw_series(LineSeries::new(
+                vec![(min_val - val_margin, min_val - val_margin), (max_val + val_margin, max_val + val_margin)],
+                BLACK.stroke_width(2),
+            )).map_err(|e| candle_core::Error::Msg(format!("Perfect prediction line error: {}", e)))?
+            .label("Perfect Prediction")
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 15, y)], BLACK.stroke_width(2)));
+
+        // Sample points for scatter plot (use every 10th point to avoid overcrowding)
+        let sample_step = (predictions.len() / 2000).max(1); // Show max 2000 points
+        let sampled_data: Vec<(f64, f64)> = predictions.iter()
+            .zip(real_values.iter())
+            .enumerate()
+            .filter(|(i, _)| i % sample_step == 0)
+            .map(|(_, (p, r))| (*r, *p))
+            .collect();
+
+        // Plot scatter points
+        upper_chart
+            .draw_series(
+                sampled_data.iter().map(|&(real, pred)| Circle::new((real, pred), 2, BLUE.mix(0.6).filled()))
+            ).map_err(|e| candle_core::Error::Msg(format!("Scatter plot error: {}", e)))?
+            .label(&format!("Data Points (n={})", sampled_data.len()))
+            .legend(|(x, y)| Circle::new((x + 5, y), 3, BLUE.mix(0.6).filled()));
+
+        upper_chart.configure_series_labels()
+            .background_style(&WHITE.mix(0.8))
+            .border_style(&BLACK)
+            .draw().map_err(|e| candle_core::Error::Msg(format!("Upper legend draw error: {}", e)))?;
+
+        // === MIDDLE PLOT: Rolling Correlation ===
+        let mut middle_chart = ChartBuilder::on(middle)
+            .caption("Rolling Correlation (500-point window)", ("sans-serif", 35))
+            .margin(10)
+            .x_label_area_size(50)
+            .y_label_area_size(80)
+            .build_cartesian_2d(
+                min_time..max_time,
+                -1.0..1.0
+            ).map_err(|e| candle_core::Error::Msg(format!("Middle chart creation error: {}", e)))?;
+
+        middle_chart
+            .configure_mesh()
+            .x_desc("Timestamp")
+            .y_desc("Correlation")
+            .draw().map_err(|e| candle_core::Error::Msg(format!("Middle mesh draw error: {}", e)))?;
+
+        // Add zero reference line for correlation
+        middle_chart
+            .draw_series(LineSeries::new(
+                vec![(min_time, 0.0), (max_time, 0.0)],
+                BLACK.stroke_width(1),
+            )).map_err(|e| candle_core::Error::Msg(format!("Correlation zero line error: {}", e)))?
+            .label("Zero Correlation")
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 15, y)], BLACK));
+
+        // Plot rolling correlation
+        if !rolling_correlations.is_empty() {
+            middle_chart
+                .draw_series(LineSeries::new(
+                    rolling_timestamps.iter().zip(rolling_correlations.iter()).map(|(&t, &c)| (t as f64, c)),
+                    MAGENTA.stroke_width(3),
+                )).map_err(|e| candle_core::Error::Msg(format!("Rolling correlation plot error: {}", e)))?
+                .label("Rolling Correlation")
+                .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 15, y)], MAGENTA.stroke_width(3)));
+        }
+
+        middle_chart.configure_series_labels()
+            .background_style(&WHITE.mix(0.8))
+            .border_style(&BLACK)
+            .draw().map_err(|e| candle_core::Error::Msg(format!("Middle legend draw error: {}", e)))?;
+
+        // === LOWER PLOT: Difference (Predicted - Real) ===
+        let min_diff = differences.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        let max_diff = differences.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        let diff_range = max_diff - min_diff;
+        let diff_margin = diff_range * 0.1;
+
+        let mut lower_chart = ChartBuilder::on(lower)
+            .caption("Prediction Error (Predicted - Real)", ("sans-serif", 35))
             .margin(10)
             .x_label_area_size(60)
             .y_label_area_size(80)
             .build_cartesian_2d(
                 min_time..max_time,
-                (min_val - val_margin)..(max_val + val_margin)
-            ).map_err(|e| candle_core::Error::Msg(format!("Chart creation error: {}", e)))?;
+                (min_diff - diff_margin)..(max_diff + diff_margin)
+            ).map_err(|e| candle_core::Error::Msg(format!("Lower chart creation error: {}", e)))?;
 
-        chart
+        lower_chart
             .configure_mesh()
             .x_desc("Timestamp")
-            .y_desc("Value (Returns)")
-            .draw().map_err(|e| candle_core::Error::Msg(format!("Mesh draw error: {}", e)))?;
+            .y_desc("Difference (Predicted - Real)")
+            .draw().map_err(|e| candle_core::Error::Msg(format!("Lower mesh draw error: {}", e)))?;
 
-        // Plot real values (blue line)
-        chart
+        // Add zero reference line
+        lower_chart
             .draw_series(LineSeries::new(
-                timestamps.iter().zip(real_values.iter()).map(|(&t, &v)| (t as f64, v)),
-                &BLUE,
-            )).map_err(|e| candle_core::Error::Msg(format!("Real values plot error: {}", e)))?
-            .label("Real Values")
-            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 10, y)], &BLUE));
+                vec![(min_time, 0.0), (max_time, 0.0)],
+                BLACK.stroke_width(1),
+            )).map_err(|e| candle_core::Error::Msg(format!("Zero line plot error: {}", e)))?
+            .label("Zero Reference")
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 15, y)], BLACK));
 
-        // Plot predictions (red line)
-        chart
+        // Plot differences (green/red based on positive/negative)
+        lower_chart
             .draw_series(LineSeries::new(
-                timestamps.iter().zip(predictions.iter()).map(|(&t, &v)| (t as f64, v)),
-                &RED,
-            )).map_err(|e| candle_core::Error::Msg(format!("Predictions plot error: {}", e)))?
-            .label("Predicted Values")
-            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 10, y)], &RED));
+                timestamps.iter().zip(differences.iter()).map(|(&t, &d)| (t as f64, d)),
+                GREEN.mix(0.8).stroke_width(2),
+            )).map_err(|e| candle_core::Error::Msg(format!("Difference plot error: {}", e)))?
+            .label("Prediction Error")
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 15, y)], GREEN.mix(0.8).stroke_width(2)));
 
-        chart.configure_series_labels().draw().map_err(|e| candle_core::Error::Msg(format!("Legend draw error: {}", e)))?;
+        lower_chart.configure_series_labels()
+            .background_style(&WHITE.mix(0.8))
+            .border_style(&BLACK)
+            .draw().map_err(|e| candle_core::Error::Msg(format!("Lower legend draw error: {}", e)))?;
 
         root.present().map_err(|e| candle_core::Error::Msg(format!("Present error: {}", e)))?;
         println!("✅ Plot saved to: {}", output_path);
@@ -314,7 +436,7 @@ fn main() -> Result<()> {
 
     // Configuration
     let data_path = "/mnt/storage-box/15m/transformed_dataset.parquet";
-    let model_path = "training_saves_15m/current_model_tiny_r4_ep408.safetensors";
+    let model_path = "training_saves_15m/current_model_middle_r3_ep396.safetensors";
 
     // Load data
     println!("\n📊 Loading cryptocurrency data...");
@@ -351,7 +473,7 @@ fn main() -> Result<()> {
     println!("✅ Model loaded from: {}", model_path);
 
     // Select a crypto for visualization (you can change this index)
-    let selected_crypto_idx = 94; // Change this to visualize different cryptos
+    let selected_crypto_idx = 23; // Change this to visualize different cryptos
     println!("🎯 Selected CRYPTO_{} for visualization", selected_crypto_idx);
 
     if selected_crypto_idx >= num_time_series {
