@@ -292,7 +292,7 @@ fn process_orderbook_data(symbol: &str, date: &str) -> Result<(), Box<dyn std::e
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let symbol = "BTCUSDC";
-    let date = "2025-07-07";
+    let date = "2025-04-30";
     
     process_orderbook_data(symbol, date)?;
     
