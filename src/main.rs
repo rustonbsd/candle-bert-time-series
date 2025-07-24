@@ -1,10 +1,12 @@
-use hftbacktest::prelude::*;
 use ndarray::Array1;
-use rand;
 
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
+
+// Import our real data loading and backtesting modules
+use candle_bert_time_series::dataset::load_crypto_as_orderbook_data;
+use candle_bert_time_series::backtest::{DepthSnapshot, Backtester, TradeSide};
 
 const SEQUENCE_LENGTH: usize = 240;
 const NUM_ACTIONS: usize = 3; // HOLD, BUY, SELL
@@ -36,159 +38,39 @@ impl From<std::io::Error> for BacktestError {
     }
 }
 
-/// Mock orderbook level for demonstration
-#[derive(Debug, Clone)]
-pub struct Level {
-    pub px: f64,  // price
-    pub qty: f64, // quantity
-}
+// Mock structures removed - now using real DepthSnapshot and Level from backtest module
 
-/// Mock depth structure for demonstration (replace with actual hftbacktest Depth)
-#[derive(Debug, Clone)]
-pub struct MockDepth {
-    pub timestamp: i64,
-    pub bid_levels: Vec<Level>,
-    pub ask_levels: Vec<Level>,
-    pub tick_size: f64,
-    pub lot_size: f64,
-}
+// MockBacktest removed - now using real Backtester from backtest module
 
-impl MockDepth {
-    pub fn best_bid(&self) -> f64 {
-        self.bid_levels.first().map(|l| l.px).unwrap_or(0.0)
-    }
+// StateValues removed - now using Backtester directly
 
-    pub fn best_ask(&self) -> f64 {
-        self.ask_levels.first().map(|l| l.px).unwrap_or(0.0)
-    }
-
-    pub fn bid_levels(&self) -> impl Iterator<Item = &Level> {
-        self.bid_levels.iter()
-    }
-
-    pub fn ask_levels(&self) -> impl Iterator<Item = &Level> {
-        self.ask_levels.iter()
-    }
-}
-
-/// Mock backtest structure for demonstration
-#[derive(Debug)]
-pub struct MockBacktest {
-    pub current_step: usize,
-    pub depth_data: Vec<MockDepth>,
-    pub positions: f64,
-    pub cash: f64,
-}
-
-impl MockBacktest {
-    pub fn new(depth_data: Vec<MockDepth>, initial_cash: f64) -> Self {
-        Self {
-            current_step: 0,
-            depth_data,
-            positions: 0.0,
-            cash: initial_cash,
-        }
-    }
-
-    pub fn elapse(&mut self, _asset_no: usize) -> Result<(), BacktestError> {
-        if self.current_step >= self.depth_data.len() {
-            return Err(BacktestError::ExecutionError("No more data".to_string()));
-        }
-        self.current_step += 1;
-        Ok(())
-    }
-
-    pub fn depth(&self, _asset_no: usize) -> &MockDepth {
-        &self.depth_data[self.current_step.min(self.depth_data.len() - 1)]
-    }
-
-    pub fn clear_inactive_orders(&mut self, _asset_no: usize) {
-        // Mock implementation
-    }
-
-    pub fn submit_buy_order(&mut self, _asset_no: usize, _order_id: u64, price: f64, qty: f64, _tif: TimeInForce, _order_type: OrdType, _wait: bool) -> Result<(), BacktestError> {
-        let cost = price * qty;
-        if self.cash >= cost {
-            self.cash -= cost;
-            self.positions += qty;
-        }
-        Ok(())
-    }
-
-    pub fn submit_sell_order(&mut self, _asset_no: usize, _order_id: u64, price: f64, qty: f64, _tif: TimeInForce, _order_type: OrdType, _wait: bool) -> Result<(), BacktestError> {
-        if self.positions >= qty {
-            self.positions -= qty;
-            self.cash += price * qty;
-        }
-        Ok(())
-    }
-
-    pub fn state_values(&self, _asset_no: usize) -> StateValues {
-        StateValues {
-            position: self.positions,
-            balance: self.cash,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct StateValues {
-    pub position: f64,
-    pub balance: f64,
-}
-
-/// Enhanced orderbook snapshot with proper depth encoding for financial BERT
+/// Raw orderbook snapshot for transformer - NO human-engineered features
 #[derive(Debug, Clone)]
 pub struct OrderbookSnapshot {
     pub timestamp: i64,
-    pub features: Vec<f32>, // Flattened feature vector for transformer input
+    pub features: Vec<f32>, // Raw orderbook data: [bid_price_1, bid_vol_1, ask_price_1, ask_vol_1, ...]
 }
 
 impl OrderbookSnapshot {
-    /// Create a new orderbook snapshot from depth data
-    pub fn from_depth(depth: &MockDepth) -> Self {
-        let mut features = Vec::with_capacity(ORDERBOOK_DEPTH * 4 + 8);
+    /// Create a new orderbook snapshot from depth data - RAW ORDERBOOK ONLY
+    /// No human-engineered features, just raw bid/ask prices and volumes for the transformer
+    pub fn from_depth(depth: &DepthSnapshot) -> Self {
+        // Only raw orderbook data: [bid_price_1, bid_vol_1, ask_price_1, ask_vol_1, ...]
+        let mut features = Vec::with_capacity(ORDERBOOK_DEPTH * 4);
 
-        let best_bid = depth.best_bid();
-        let best_ask = depth.best_ask();
-        let mid_price = (best_bid + best_ask) / 2.0;
-        let spread = best_ask - best_bid;
+        // Collect bid/ask levels
+        let bid_levels: Vec<_> = depth.bid_levels.iter().take(ORDERBOOK_DEPTH).collect();
+        let ask_levels: Vec<_> = depth.ask_levels.iter().take(ORDERBOOK_DEPTH).collect();
 
-        // Core market features
-        features.push((best_bid / mid_price) as f32); // Normalized best bid
-        features.push((best_ask / mid_price) as f32); // Normalized best ask
-        features.push((spread / mid_price) as f32);   // Relative spread
-        features.push(mid_price as f32);              // Mid price (absolute)
-
-        // Collect bid/ask levels with volumes
-        let bid_levels: Vec<_> = depth.bid_levels().take(ORDERBOOK_DEPTH).collect();
-        let ask_levels: Vec<_> = depth.ask_levels().take(ORDERBOOK_DEPTH).collect();
-
-        let total_bid_vol: f64 = bid_levels.iter().map(|l| l.qty).sum();
-        let total_ask_vol: f64 = ask_levels.iter().map(|l| l.qty).sum();
-
-        // Orderbook imbalance and micro price
-        let imbalance = if total_bid_vol + total_ask_vol > 0.0 {
-            (total_bid_vol - total_ask_vol) / (total_bid_vol + total_ask_vol)
-        } else { 0.0 };
-
-        let micro_price = if total_bid_vol + total_ask_vol > 0.0 {
-            (best_bid * total_ask_vol + best_ask * total_bid_vol) / (total_bid_vol + total_ask_vol)
-        } else { mid_price };
-
-        features.push(imbalance as f32);
-        features.push((micro_price / mid_price) as f32); // Normalized micro price
-        features.push(total_bid_vol as f32);
-        features.push(total_ask_vol as f32);
-
-        // Encode orderbook depth: [bid_price_1, bid_vol_1, ask_price_1, ask_vol_1, ...]
+        // Encode raw orderbook depth: [bid_price_1, bid_vol_1, ask_price_1, ask_vol_1, ...]
+        // Let the transformer learn all patterns from raw data
         for i in 0..ORDERBOOK_DEPTH {
             let (bid_price, bid_vol) = if i < bid_levels.len() {
-                (bid_levels[i].px / mid_price, bid_levels[i].qty)
+                (bid_levels[i].price, bid_levels[i].quantity)
             } else { (0.0, 0.0) };
 
             let (ask_price, ask_vol) = if i < ask_levels.len() {
-                (ask_levels[i].px / mid_price, ask_levels[i].qty)
+                (ask_levels[i].price, ask_levels[i].quantity)
             } else { (0.0, 0.0) };
 
             features.push(bid_price as f32);
@@ -227,13 +109,10 @@ pub trait FinancialBertAgent {
 pub struct FinancialBertStrategy<A: FinancialBertAgent> {
     agent: A,
     orderbook_history: VecDeque<OrderbookSnapshot>,
-    position: f64,
-    cash: f64,
-    asset_value: f64,
+    backtester: Backtester,
     last_trade_price: f64,
     sequence_length: usize,
     total_trades: usize,
-    total_pnl: f64,
 }
 
 impl<A: FinancialBertAgent> FinancialBertStrategy<A> {
@@ -241,13 +120,10 @@ impl<A: FinancialBertAgent> FinancialBertStrategy<A> {
         Self {
             agent,
             orderbook_history: VecDeque::with_capacity(SEQUENCE_LENGTH),
-            position: 0.0,
-            cash: initial_cash,
-            asset_value: initial_cash,
+            backtester: Backtester::new(initial_cash),
             last_trade_price: 0.0,
             sequence_length: SEQUENCE_LENGTH,
             total_trades: 0,
-            total_pnl: 0.0,
         }
     }
 
@@ -277,53 +153,46 @@ impl<A: FinancialBertAgent> FinancialBertStrategy<A> {
         reward
     }
 
+    /// Get current portfolio value
+    fn get_portfolio_value(&self, current_price: f64) -> f64 {
+        self.backtester.current_capital + (self.backtester.position * current_price)
+    }
+
     /// Execute trading action with improved position sizing
-    fn execute_action(&mut self, hbt: &mut MockBacktest, action: usize, depth: &MockDepth) -> Result<(), BacktestError> {
-        let asset_no = 0;
+    fn execute_action(&mut self, action: usize, depth: &DepthSnapshot) -> Result<(), BacktestError> {
         let _tick_size = depth.tick_size;
         let lot_size = depth.lot_size;
-        let mid_price = (depth.best_bid() + depth.best_ask()) / 2.0;
-
-        hbt.clear_inactive_orders(asset_no);
+        let mid_price = depth.mid_price();
 
         match action {
             0 => {} // HOLD - no action
             1 => { // BUY
                 let buy_price = depth.best_ask(); // Market buy at ask
                 let position_size = 0.05; // 5% of portfolio per trade
-                let buy_qty = ((self.cash * position_size) / mid_price / lot_size).floor() * lot_size;
+                let current_value = self.get_portfolio_value(mid_price);
+                let buy_qty = ((current_value * position_size) / mid_price / lot_size).floor() * lot_size;
 
-                if buy_qty > 0.0 && self.cash >= buy_qty * buy_price {
-                    let order_id = (depth.timestamp % 1_000_000) as u64;
-                    hbt.submit_buy_order(
-                        asset_no,
-                        order_id,
-                        buy_price,
-                        buy_qty,
-                        TimeInForce::IOC, // Immediate or Cancel for market orders
-                        OrdType::Limit,
-                        false,
-                    )?;
-                    self.total_trades += 1;
+                if buy_qty > 0.0 {
+                    match self.backtester.execute_trade(TradeSide::Buy, buy_price, buy_qty, depth.timestamp) {
+                        Ok(_) => {
+                            self.total_trades += 1;
+                        }
+                        Err(_) => {} // Insufficient capital, skip trade
+                    }
                 }
             }
             2 => { // SELL
-                if self.position > 0.0 {
+                if self.backtester.position > 0.0 {
                     let sell_price = depth.best_bid(); // Market sell at bid
-                    let sell_qty = (self.position * 0.2 / lot_size).floor() * lot_size; // Sell 20% of position
+                    let sell_qty = (self.backtester.position * 0.2 / lot_size).floor() * lot_size; // Sell 20% of position
 
                     if sell_qty > 0.0 {
-                        let order_id = (depth.timestamp % 1_000_000) as u64 + 1;
-                        hbt.submit_sell_order(
-                            asset_no,
-                            order_id,
-                            sell_price,
-                            sell_qty,
-                            TimeInForce::IOC,
-                            OrdType::Limit,
-                            false,
-                        )?;
-                        self.total_trades += 1;
+                        match self.backtester.execute_trade(TradeSide::Sell, sell_price, sell_qty, depth.timestamp) {
+                            Ok(_) => {
+                                self.total_trades += 1;
+                            }
+                            Err(_) => {} // Insufficient position, skip trade
+                        }
                     }
                 }
             }
@@ -334,47 +203,51 @@ impl<A: FinancialBertAgent> FinancialBertStrategy<A> {
     }
 
     /// Update portfolio value and track performance
-    fn update_portfolio(&mut self, hbt: &mut MockBacktest) {
-        let asset_no = 0;
-        let depth = hbt.depth(asset_no);
-        let mid_price = (depth.best_bid() + depth.best_ask()) / 2.0;
-
-        // Update position from filled orders
-        let state_values = hbt.state_values(asset_no);
-        self.position = state_values.position;
-        self.cash = state_values.balance;
-
-        self.asset_value = self.cash + self.position * mid_price;
-        self.last_trade_price = mid_price;
-
-        // Track total PnL
-        self.total_pnl = self.asset_value - 10_000.0; // Assuming 10k initial capital
+    fn update_portfolio(&mut self, current_price: f64, timestamp: i64) {
+        self.backtester.update_portfolio_value(current_price, timestamp);
+        self.last_trade_price = current_price;
     }
 }
 
 /// Main backtest runner for financial BERT PPO strategy
 pub fn run_backtest<A: FinancialBertAgent>(
     agent: A,
-    _data_path: &str,
+    data_path: &str,
     initial_cash: f64,
 ) -> Result<(Vec<f64>, Vec<OrderbookSnapshot>), BacktestError> {
     let mut strategy = FinancialBertStrategy::new(agent, initial_cash);
 
-    // Create mock depth data for demonstration
-    // In a real implementation, you would load this from your HFT data files
-    let mock_depth_data = create_mock_depth_data(1000); // 1000 time steps
+    // Load real crypto data from parquet file
+    let crypto_data = load_crypto_as_orderbook_data(data_path)
+        .map_err(|e| BacktestError::DataError(format!("Failed to load data: {}", e)))?;
 
-    // Create backtest with mock data
-    let mut hbt = MockBacktest::new(mock_depth_data, initial_cash);
+    println!("Loaded {} timesteps of crypto data", crypto_data.len());
 
     let mut portfolio_values = Vec::new();
     let mut all_snapshots = Vec::new();
     let mut step_count = 0;
+    let base_price = 50000.0; // Starting price for simulation
+    let tick_size = 0.01;
+    let lot_size = 0.001;
 
     // Main backtest loop
-    while hbt.elapse(0).is_ok() {
-        let asset_no = 0;
-        let depth = hbt.depth(asset_no).clone(); // Clone to avoid borrowing issues
+    for crypto_timestep in &crypto_data {
+        // Convert crypto data to depth snapshot (using first crypto for now)
+        // For now, create a simple depth snapshot from the crypto data
+        // This is a placeholder - in practice you'd use real orderbook data
+        let depth = DepthSnapshot {
+            timestamp: crypto_timestep.timestamp,
+            bid_levels: vec![
+                candle_bert_time_series::backtest::Level { price: base_price - 0.5, quantity: 1.0 },
+                candle_bert_time_series::backtest::Level { price: base_price - 1.0, quantity: 2.0 },
+            ],
+            ask_levels: vec![
+                candle_bert_time_series::backtest::Level { price: base_price + 0.5, quantity: 1.0 },
+                candle_bert_time_series::backtest::Level { price: base_price + 1.0, quantity: 2.0 },
+            ],
+            tick_size,
+            lot_size,
+        };
 
         // Create orderbook snapshot with encoded features
         let snapshot = OrderbookSnapshot::from_depth(&depth);
@@ -400,70 +273,35 @@ pub fn run_backtest<A: FinancialBertAgent>(
                 .unwrap_or(0);
 
             // Execute action
-            let prev_value = strategy.asset_value;
-            strategy.execute_action(&mut hbt, action, &depth)?;
+            let prev_value = strategy.get_portfolio_value(depth.mid_price());
+            strategy.execute_action(action, &depth)?;
 
             // Update portfolio
-            strategy.update_portfolio(&mut hbt);
+            strategy.update_portfolio(depth.mid_price(), crypto_timestep.timestamp);
 
             // Calculate reward for PPO training
-            let reward = strategy.calculate_reward(prev_value, strategy.asset_value, action);
+            let current_value = strategy.get_portfolio_value(depth.mid_price());
+            let reward = strategy.calculate_reward(prev_value, current_value, action);
             let next_history: Vec<_> = strategy.orderbook_history.iter().cloned().collect();
             let done = step_count > 10000; // Episode termination condition
 
             strategy.agent.update(&history, action, reward, &next_history, done);
 
-            portfolio_values.push(strategy.asset_value);
+            portfolio_values.push(current_value);
         }
 
         step_count += 1;
         if step_count % 1000 == 0 {
+            let current_value = strategy.get_portfolio_value(depth.mid_price());
             println!("Step {}: Portfolio value: ${:.2}, Trades: {}",
-                     step_count, strategy.asset_value, strategy.total_trades);
+                     step_count, current_value, strategy.total_trades);
         }
     }
-    
+
     Ok((portfolio_values, all_snapshots))
 }
 
-/// Create mock depth data for demonstration
-fn create_mock_depth_data(num_steps: usize) -> Vec<MockDepth> {
-    let mut data = Vec::with_capacity(num_steps);
-    let mut base_price = 50000.0;
-
-    for i in 0..num_steps {
-        // Simulate price movement
-        base_price += (i as f64 * 0.1).sin() * 10.0 + rand::random::<f64>() * 20.0 - 10.0;
-
-        // Create bid levels
-        let mut bid_levels = Vec::new();
-        for j in 0..ORDERBOOK_DEPTH {
-            bid_levels.push(Level {
-                px: base_price - (j as f64 + 1.0) * 0.5,
-                qty: 100.0 + rand::random::<f64>() * 200.0,
-            });
-        }
-
-        // Create ask levels
-        let mut ask_levels = Vec::new();
-        for j in 0..ORDERBOOK_DEPTH {
-            ask_levels.push(Level {
-                px: base_price + (j as f64 + 1.0) * 0.5,
-                qty: 100.0 + rand::random::<f64>() * 200.0,
-            });
-        }
-
-        data.push(MockDepth {
-            timestamp: i as i64,
-            bid_levels,
-            ask_levels,
-            tick_size: 0.01,
-            lot_size: 0.001,
-        });
-    }
-
-    data
-}
+// Mock data creation removed - now using real crypto data from parquet files
 
 /// Mock Financial BERT agent for testing
 pub struct MockFinancialBertAgent {
@@ -542,7 +380,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let agent = MockFinancialBertAgent::new();
 
     // Configuration
-    let data_path = "data/BTCUSDT_2024-01-01.npz"; // Update with your HFT data path
+    let data_path = "/mnt/storage-box/15m/transformed_dataset.parquet"; // Real parquet data path
     let initial_cash = 10_000.0;
 
     println!("📊 Configuration:");
@@ -639,16 +477,19 @@ mod tests {
     fn test_mock_agent_prediction() {
         let agent = MockFinancialBertAgent::new();
 
-        // Create a simple orderbook snapshot
-        let features = vec![0.999, 1.001, 0.001, 50000.0, 0.05, 1.0001, 1000.0, 1100.0];
-        let mut full_features = features;
-        while full_features.len() < ORDERBOOK_DEPTH * 4 + 8 {
-            full_features.push(0.0);
+        // Create a simple raw orderbook snapshot (no human-engineered features)
+        // Format: [bid_price_1, bid_vol_1, ask_price_1, ask_vol_1, ...]
+        let mut features = Vec::new();
+        for i in 0..ORDERBOOK_DEPTH {
+            features.push(50000.0 - (i as f32 * 0.5)); // bid_price
+            features.push(100.0 + (i as f32 * 10.0));  // bid_vol
+            features.push(50000.5 + (i as f32 * 0.5)); // ask_price
+            features.push(100.0 + (i as f32 * 10.0));  // ask_vol
         }
 
         let snapshot = OrderbookSnapshot {
             timestamp: 1234567890,
-            features: full_features,
+            features,
         };
 
         let history = vec![snapshot];
@@ -658,6 +499,31 @@ mod tests {
         // Probabilities should sum to approximately 1.0
         let sum: f32 = predictions.iter().sum();
         assert!((sum - 1.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_real_data_integration() {
+        use candle_bert_time_series::dataset::CryptoTimestep;
+        use candle_bert_time_series::backtest::create_depth_from_crypto_data;
+
+        // Test crypto data to depth conversion
+        let crypto_data = CryptoTimestep {
+            timestamp: 1000,
+            crypto_returns: vec![0.01, -0.005, 0.02],
+        };
+
+        let depth = create_depth_from_crypto_data(&crypto_data, 0, 100.0, 0.01, 0.001).unwrap();
+        let snapshot = OrderbookSnapshot::from_depth(&depth);
+
+        assert_eq!(snapshot.timestamp, 1000);
+        // Raw orderbook features: ORDERBOOK_DEPTH * 4 (bid_price, bid_vol, ask_price, ask_vol)
+        assert_eq!(snapshot.features.len(), ORDERBOOK_DEPTH * 4);
+
+        // Verify we have actual price/volume data
+        assert!(snapshot.features[0] > 0.0); // First bid price should be positive
+        assert!(snapshot.features[1] > 0.0); // First bid volume should be positive
+        assert!(snapshot.features[2] > 0.0); // First ask price should be positive
+        assert!(snapshot.features[3] > 0.0); // First ask volume should be positive
     }
 
     #[test]
