@@ -125,7 +125,8 @@ fn print_data_statistics(data: &Tensor) -> Result<()> {
     println!("  ℹ️  NaN/Inf checking skipped (not available in candle)");
     
     // Check data distribution
-    let zero_count = flattened.eq(&Tensor::zeros_like(&flattened)?)?.sum_all()?.to_scalar::<f32>()?;
+    let zero_mask = flattened.eq(&Tensor::zeros_like(&flattened)?)?;
+    let zero_count = zero_mask.to_dtype(candle_core::DType::F32)?.sum_all()?.to_scalar::<f32>()?;
     let total_elements = flattened.elem_count() as f32;
     let zero_percentage = (zero_count / total_elements) * 100.0;
     

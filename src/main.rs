@@ -26,7 +26,7 @@ use candle_bert_time_series::batcher::Batcher;
 use candle_bert_time_series::financial_bert::{Config, FinancialTransformerForMaskedRegression, HiddenAct, PositionEmbeddingType};
 use orderbook_dataset::load_and_prepare_orderbook_data;
 
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor, IndexOp};
 use candle_nn::{loss, Optimizer, VarBuilder, VarMap};
 use rand::Rng;
 
@@ -37,18 +37,19 @@ const NUM_LAYERS: usize = 8;
 const NUM_HEADS: usize = 8;
 const NUM_EPOCHS: usize = 500;
 const TEST_MODE: bool = false; // Set to true for quick testing with fewer epochs
-const LEARNING_RATE: f64 = 3e-6;
+const LEARNING_RATE: f64 = 5e-5;
 const MASK_PROB: f32 = 0.15;
 const ORDERBOOK_MASK_PROB: f32 = 0.15; // Percentage of orderbook levels to mask
 const BATCH_SIZE: usize = 256;
 
 // Data file path - update this to point to your orderbook parquet files
+// Using the properly normalized files with quantile normalization
 const DATA_PATHS: &[&str] = &[
-    "/mnt/storage-box/bybit/orderbooks/output/2025-04-30_BTCUSDC_financialbert.parquet",
-    "/mnt/storage-box/bybit/orderbooks/output/2025-05-01_BTCUSDC_financialbert.parquet",
-    "/mnt/storage-box/bybit/orderbooks/output/2025-05-02_BTCUSDC_financialbert.parquet",
-    "/mnt/storage-box/bybit/orderbooks/output/2025-05-03_BTCUSDC_financialbert.parquet",
-    "/mnt/storage-box/bybit/orderbooks/output/2025-05-04_BTCUSDC_financialbert.parquet",
+    "/mnt/storage-box/bybit/orderbooks/output/2025-04-30_BTCUSDC_financialbert_quantile_normal.parquet",
+    "/mnt/storage-box/bybit/orderbooks/output/2025-05-01_BTCUSDC_financialbert_quantile_normal.parquet",
+    "/mnt/storage-box/bybit/orderbooks/output/2025-05-02_BTCUSDC_financialbert_quantile_normal.parquet",
+    "/mnt/storage-box/bybit/orderbooks/output/2025-05-03_BTCUSDC_financialbert_quantile_normal.parquet",
+    "/mnt/storage-box/bybit/orderbooks/output/2025-05-04_BTCUSDC_financialbert_quantile_normal.parquet",
     // Add more files as needed - the loader will skip missing files
 ];
 
@@ -61,16 +62,18 @@ fn mask_data_random(
 ) -> Result<(Tensor, Tensor, Tensor)> {
     let shape = input.shape();
     let rand_mask = Tensor::rand(0f32, 1f32, shape, device)?;
-    let mask = (rand_mask.lt(MASK_PROB))?;
+    let mask_bool = (rand_mask.lt(MASK_PROB))?;
+    let mask = mask_bool.to_dtype(DType::U8)?; // Convert to u8 for where_cond
     let zeros = Tensor::zeros(shape, input.dtype(), device)?;
 
     // Extract true labels for masked positions
     let true_labels = mask.where_cond(input, &zeros)?;
 
     // Create masked input by zeroing out the masked positions
-    let ones = Tensor::ones(shape, DType::U8, device)?;
-    let inverted_mask = ones.sub(&mask)?;
-    let masked_input = input.broadcast_mul(&inverted_mask.to_dtype(DType::F32)?)?;
+    let ones = Tensor::ones(shape, DType::F32, device)?;
+    let mask_f32 = mask.to_dtype(DType::F32)?;
+    let inverted_mask = ones.sub(&mask_f32)?;
+    let masked_input = input.broadcast_mul(&inverted_mask)?;
 
     Ok((masked_input, true_labels, mask))
 }
@@ -108,19 +111,20 @@ fn mask_data_orderbook_levels(
     // Create mask tensor and broadcast to full shape
     let feature_mask = Tensor::from_vec(feature_mask_vec, &[num_features], device)?;
     let mask_3d = feature_mask.unsqueeze(0)?.unsqueeze(0)?;
-    let mask = mask_3d.broadcast_as(shape)?;
-    
+    let mask_u8 = mask_3d.broadcast_as(shape)?;
+
     let zeros = Tensor::zeros(shape, input.dtype(), device)?;
-    
+
     // Extract true labels for masked positions
-    let true_labels = mask.where_cond(input, &zeros)?;
-    
+    let true_labels = mask_u8.where_cond(input, &zeros)?;
+
     // Create masked input
-    let ones = Tensor::ones(shape, DType::U8, device)?;
-    let inverted_mask = ones.sub(&mask)?;
-    let masked_input = input.broadcast_mul(&inverted_mask.to_dtype(DType::F32)?)?;
-    
-    Ok((masked_input, true_labels, mask.to_dtype(DType::U8)?))
+    let ones = Tensor::ones(shape, DType::F32, device)?;
+    let mask_f32 = mask_u8.to_dtype(DType::F32)?;
+    let inverted_mask = ones.sub(&mask_f32)?;
+    let masked_input = input.broadcast_mul(&inverted_mask)?;
+
+    Ok((masked_input, true_labels, mask_u8))
 }
 
 /// Temporal masking: mask the most recent timesteps
@@ -140,22 +144,23 @@ fn mask_data_temporal(
     for i in start_mask..seq_len {
         temporal_mask_vec[i] = 1;
     }
-    
+
     let temporal_mask = Tensor::from_vec(temporal_mask_vec, &[seq_len], device)?;
     let mask_3d = temporal_mask.unsqueeze(0)?.unsqueeze(2)?;
-    let mask = mask_3d.broadcast_as(shape)?;
-    
+    let mask_u8 = mask_3d.broadcast_as(shape)?;
+
     let zeros = Tensor::zeros(shape, input.dtype(), device)?;
-    
+
     // Extract true labels for masked positions
-    let true_labels = mask.where_cond(input, &zeros)?;
-    
+    let true_labels = mask_u8.where_cond(input, &zeros)?;
+
     // Create masked input
-    let ones = Tensor::ones(shape, DType::U8, device)?;
-    let inverted_mask = ones.sub(&mask)?;
-    let masked_input = input.broadcast_mul(&inverted_mask.to_dtype(DType::F32)?)?;
-    
-    Ok((masked_input, true_labels, mask))
+    let ones = Tensor::ones(shape, DType::F32, device)?;
+    let mask_f32 = mask_u8.to_dtype(DType::F32)?;
+    let inverted_mask = ones.sub(&mask_f32)?;
+    let masked_input = input.broadcast_mul(&inverted_mask)?;
+
+    Ok((masked_input, true_labels, mask_u8))
 }
 
 /// Evaluation function for model performance
@@ -180,10 +185,11 @@ where
         let predictions = model.forward(&masked_input)?;
         
         // Calculate loss only on masked positions
-        let masked_predictions = mask.where_cond(&predictions, &Tensor::zeros_like(&predictions)?)?;
+        let mask_u8 = if mask.dtype() != DType::U8 { mask.to_dtype(DType::U8)? } else { mask.clone() };
+        let masked_predictions = mask_u8.where_cond(&predictions, &Tensor::zeros_like(&predictions)?)?;
         let loss = loss::mse(&masked_predictions, &true_labels)?;
         
-        total_loss += loss.to_scalar::<f64>()?;
+        total_loss += loss.to_scalar::<f32>()? as f64;
         batch_count += 1;
     }
 
@@ -191,6 +197,79 @@ where
     println!("  {} Loss: {:.10} (averaged over {} batches)", dataset_name, avg_loss, batch_count);
 
     Ok(avg_loss)
+}
+
+/// Detailed data analysis to identify potential issues
+fn detailed_data_analysis(data: &Tensor) -> Result<()> {
+    println!("Analyzing data for potential issues...");
+
+    let shape = data.shape();
+    let flattened = data.flatten_all()?;
+
+    // Basic statistics
+    let mean = flattened.mean_all()?.to_scalar::<f32>()?;
+    let std = flattened.var(0)?.sqrt()?.to_scalar::<f32>()?;
+    let min_val = flattened.min(0)?.to_scalar::<f32>()?;
+    let max_val = flattened.max(0)?.to_scalar::<f32>()?;
+
+    println!("  Overall stats: mean={:.6}, std={:.6}, min={:.6}, max={:.6}",
+             mean, std, min_val, max_val);
+
+    // Check for extreme outliers (values beyond 4 standard deviations)
+    let outlier_threshold = 4.0;
+    let lower_bound = mean - outlier_threshold * std;
+    let upper_bound = mean + outlier_threshold * std;
+
+    // Count outliers (approximate method since candle doesn't have advanced filtering)
+    let total_elements = flattened.elem_count();
+    println!("  Outlier bounds: [{:.6}, {:.6}] (±{} std)",
+             lower_bound, upper_bound, outlier_threshold);
+
+    if max_val > upper_bound || min_val < lower_bound {
+        println!("  ⚠️  EXTREME OUTLIERS DETECTED!");
+        println!("     Max value {:.6} exceeds upper bound {:.6}", max_val, upper_bound);
+        println!("     This could cause training instability!");
+    }
+
+    // Analyze feature-wise statistics
+    println!("  Analyzing individual features...");
+    let num_features = shape.dims()[1];
+    let num_timesteps = shape.dims()[0];
+
+    for feature_idx in 0..num_features.min(10) { // Check first 10 features
+        let feature_data = data.narrow(1, feature_idx, 1)?.flatten_all()?;
+        let f_mean = feature_data.mean_all()?.to_scalar::<f32>()?;
+        let f_std = feature_data.var(0)?.sqrt()?.to_scalar::<f32>()?;
+        let f_min = feature_data.min(0)?.to_scalar::<f32>()?;
+        let f_max = feature_data.max(0)?.to_scalar::<f32>()?;
+
+        println!("    Feature {}: mean={:.4}, std={:.4}, min={:.4}, max={:.4}",
+                 feature_idx, f_mean, f_std, f_min, f_max);
+
+        if f_max > f_mean + 10.0 * f_std {
+            println!("      ⚠️  Feature {} has extreme outliers!", feature_idx);
+        }
+    }
+
+    // Check for constant features
+    println!("  Checking for constant/near-constant features...");
+    for feature_idx in 0..num_features.min(20) {
+        let feature_data = data.narrow(1, feature_idx, 1)?.flatten_all()?;
+        let f_std = feature_data.var(0)?.sqrt()?.to_scalar::<f32>()?;
+
+        if f_std < 1e-6 {
+            println!("    ⚠️  Feature {} is nearly constant (std={:.8})", feature_idx, f_std);
+        }
+    }
+
+    // Sample some actual values to inspect
+    println!("  Sample values from first timestep:");
+    for i in 0..num_features.min(10) {
+        let val = data.i((0, i))?;
+        println!("    Feature {}: {:.6}", i, val.to_scalar::<f32>()?);
+    }
+
+    Ok(())
 }
 
 // --- The Main Training Function ---
@@ -216,6 +295,11 @@ fn main() -> Result<()> {
     // --- Data Loading First to Determine Dimensions ---
     println!("Loading orderbook data...");
     let (full_data_sequence, num_features) = load_and_prepare_orderbook_data(DATA_PATHS, &device)?;
+
+    // DETAILED DATA ANALYSIS FOR DEBUGGING
+    println!("\n🔍 DETAILED DATA ANALYSIS:");
+    detailed_data_analysis(&full_data_sequence)?;
+
     let total_timesteps = full_data_sequence.dims()[0];
 
     // Split data into train (70%), validation (15%), test (15%)
@@ -296,17 +380,18 @@ fn main() -> Result<()> {
 
             // --- LOSS CALCULATION ---
             // Calculate loss only on masked positions
-            let masked_predictions = mask.where_cond(&predictions, &Tensor::zeros_like(&predictions)?)?;
+            let mask_u8 = if mask.dtype() != DType::U8 { mask.to_dtype(DType::U8)? } else { mask.clone() };
+            let masked_predictions = mask_u8.where_cond(&predictions, &Tensor::zeros_like(&predictions)?)?;
             let loss = loss::mse(&masked_predictions, &true_labels)?;
 
             // --- BACKWARD PASS ---
             optimizer.backward_step(&loss)?;
 
-            total_train_loss += loss.to_scalar::<f64>()?;
+            total_train_loss += loss.to_scalar::<f32>()? as f64;
             train_batch_count += 1;
 
             if train_batch_count % 100 == 0 {
-                println!("  Batch {}: Loss = {:.10}", train_batch_count, loss.to_scalar::<f64>()?);
+                println!("  Batch {}: Loss = {:.10}", train_batch_count, loss.to_scalar::<f32>()? as f64);
             }
         }
 

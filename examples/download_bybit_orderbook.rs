@@ -8,6 +8,11 @@ use ordered_float::OrderedFloat;
 use chrono::{NaiveDate, Utc, Duration};
 use rayon::prelude::*;
 
+// Import our normalization library
+use candle_bert_time_series::normalization::{
+    compute_column_stats, create_quantile_strategy, normalize_value
+};
+
 
 const BYBIT_BASE_URL: &str = "https://quote-saver.bycsi.com/orderbook/spot";
 
@@ -279,12 +284,15 @@ fn reconstruct_orderbook_snapshots_fast(events: Vec<OrderBookEvent>) -> Result<V
 ///
 /// This function:
 /// 1. Filters snapshots to 200ms intervals (5 ticks per second)
-/// 2. Normalizes prices and quantities using z-score normalization (μ=0, σ=1)
+/// 2. Applies quantile normalization to all features (prices and quantities)
+///    - Maps empirical quantiles to standard normal quantiles
+///    - Works for any distribution shape (normal, skewed, heavy-tailed, etc.)
+///    - Always produces exact standard normal output (mean=0, std=1)
 /// 3. Creates feature vectors with configurable orderbook depth (default: 20 levels)
 /// 4. Saves as parquet file with timestamp + feature columns
 ///
 /// Output format: timestamp, bid_price_0, bid_qty_0, ask_price_0, ask_qty_0, ..., bid_price_19, bid_qty_19, ask_price_19, ask_qty_19
-/// Each row represents one 200ms tick with normalized orderbook features
+/// Each row represents one 200ms tick with quantile-normalized orderbook features
 fn save_financialbert_dataset(snapshots: Vec<OrderBookSnapshot>, output_path: &Path, _symbol: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("Converting to FinancialBERT training format...");
 
@@ -310,7 +318,9 @@ fn save_financialbert_dataset(snapshots: Vec<OrderBookSnapshot>, output_path: &P
         return Err("No snapshots available for FinancialBERT dataset".into());
     }
 
-    // Calculate normalization parameters from all data
+    // Calculate normalization parameters using the proper library
+    println!("  Computing normalization statistics...");
+
     let mut all_prices = Vec::new();
     let mut all_quantities = Vec::new();
 
@@ -329,25 +339,24 @@ fn save_financialbert_dataset(snapshots: Vec<OrderBookSnapshot>, output_path: &P
         }
     }
 
-    // Calculate normalization statistics
-    let price_mean = all_prices.iter().sum::<f64>() / all_prices.len() as f64;
-    let price_std = {
-        let variance = all_prices.iter()
-            .map(|&p| (p - price_mean).powi(2))
-            .sum::<f64>() / all_prices.len() as f64;
-        variance.sqrt()
-    };
+    // Use quantile normalization for everything - it's distribution-agnostic and always works
+    println!("  🔧 Using quantile normalization for all features (distribution-agnostic)");
 
-    let qty_mean = all_quantities.iter().sum::<f64>() / all_quantities.len() as f64;
-    let qty_std = {
-        let variance = all_quantities.iter()
-            .map(|&q| (q - qty_mean).powi(2))
-            .sum::<f64>() / all_quantities.len() as f64;
-        variance.sqrt()
-    };
+    // Compute statistics for informational purposes
+    let price_stats = compute_column_stats(&all_prices);
+    let quantity_stats = compute_column_stats(&all_quantities);
 
-    println!("Normalization stats - Price: μ={:.2}, σ={:.2} | Qty: μ={:.4}, σ={:.4}",
-             price_mean, price_std, qty_mean, qty_std);
+    println!("  📊 Price statistics:");
+    println!("     Mean: {:.6}, Std: {:.6}, Skewness: {:.3}, Kurtosis: {:.3}",
+             price_stats.mean, price_stats.std, price_stats.skewness, price_stats.kurtosis);
+
+    println!("  📊 Quantity statistics:");
+    println!("     Mean: {:.6}, Std: {:.6}, Skewness: {:.3}, Kurtosis: {:.3}",
+             quantity_stats.mean, quantity_stats.std, quantity_stats.skewness, quantity_stats.kurtosis);
+
+    // Create quantile normalization strategies for both prices and quantities
+    let price_strategy = create_quantile_strategy(&all_prices);
+    let quantity_strategy = create_quantile_strategy(&all_quantities);
 
     // Create normalized feature vectors in parallel
     let feature_size = orderbook_depth * 4; // bid_price, bid_qty, ask_price, ask_qty per level
@@ -372,9 +381,10 @@ fn save_financialbert_dataset(snapshots: Vec<OrderBookSnapshot>, output_path: &P
                 for (i, bid) in snapshot.bids.iter().take(orderbook_depth).enumerate() {
                     let base_idx = i * 4;
                     if bid.price > 0.0 && bid.quantity > 0.0 {
-                        // Normalize price and quantity using z-score normalization
-                        features[base_idx] = ((bid.price - price_mean) / price_std) as f32;     // bid_price
-                        features[base_idx + 1] = ((bid.quantity - qty_mean) / qty_std) as f32; // bid_qty
+                        // Normalize price using the proper library
+                        features[base_idx] = normalize_value(bid.price, &price_strategy) as f32;     // bid_price
+                        // Normalize quantity using the proper library
+                        features[base_idx + 1] = normalize_value(bid.quantity, &quantity_strategy) as f32; // bid_qty
                     }
                     // ask_price and ask_qty remain 0.0 for bid levels
                 }
@@ -383,9 +393,10 @@ fn save_financialbert_dataset(snapshots: Vec<OrderBookSnapshot>, output_path: &P
                 for (i, ask) in snapshot.asks.iter().take(orderbook_depth).enumerate() {
                     let base_idx = i * 4;
                     if ask.price > 0.0 && ask.quantity > 0.0 {
-                        // Normalize price and quantity using z-score normalization
-                        features[base_idx + 2] = ((ask.price - price_mean) / price_std) as f32; // ask_price
-                        features[base_idx + 3] = ((ask.quantity - qty_mean) / qty_std) as f32;  // ask_qty
+                        // Normalize price using the proper library
+                        features[base_idx + 2] = normalize_value(ask.price, &price_strategy) as f32; // ask_price
+                        // Normalize quantity using the proper library
+                        features[base_idx + 3] = normalize_value(ask.quantity, &quantity_strategy) as f32;  // ask_qty
                     }
                     // bid_price and bid_qty remain 0.0 for ask levels
                 }
@@ -445,7 +456,8 @@ fn save_financialbert_dataset(snapshots: Vec<OrderBookSnapshot>, output_path: &P
         .finish(&mut df.clone())?;
 
     println!("✅ Saved FinancialBERT dataset to {:?}", output_path);
-    println!("   Normalization: Z-score (μ=0, σ=1)");
+    println!("   Normalization: Quantile normalization for all features (distribution-agnostic)");
+    println!("   Output: Standard normal distribution (μ=0, σ=1) for all features");
     println!("   Tick interval: {}ms", tick_interval_ms);
     println!("   Orderbook depth: {} levels per side", orderbook_depth);
 

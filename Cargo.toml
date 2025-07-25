@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-candle-core = { version = "0.9.1", features = [] }
-candle-nn = { version = "0.9.1", features = [] }
-candle-transformers = { version = "0.9.1", features = [] }
+candle-core = { version = "0.9.1", features = ["cuda"] }
+candle-nn = { version = "0.9.1", features = ["cuda"] }
+candle-transformers = { version = "0.9.1", features = ["cuda"] }
 anyhow = "1"
 tokio ={ version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -34,3 +34,15 @@ reqwest = { version = "0.11", features = ["json", "blocking"] }
 # ZIP archive handling
 zip = "1.1"
 ndarray = "0.16.1"
+
+[[bin]]
+name = "fix_orderbook_normalization"
+path = "examples/fix_orderbook_normalization.rs"
+
+[[bin]]
+name = "analyze_quantity_distribution"
+path = "examples/analyze_quantity_distribution.rs"
+
+[[bin]]
+name = "proper_orderbook_normalization"
+path = "examples/proper_orderbook_normalization.rs"
